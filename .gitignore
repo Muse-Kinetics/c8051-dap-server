@@ -1,0 +1,48 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# CMake / build output
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+
+# Visual Studio / MSBuild
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+*.ncb
+*.opt
+*.plg
+*.aps
+
+# Build artifacts
+[Dd]ebug/
+[Rr]elease/
+*.obj
+*.pch
+*.pdb
+*.idb
+*.ilk
+*.bsc
+*.res
+*.exp
+*.lib
+*.dll
+*.exe
+
+# Vendor DLLs — obtain from a licensed Keil µVision installation
+silabs_ref/
+
+# Runtime log output
+*.log
+stderr_log.txt

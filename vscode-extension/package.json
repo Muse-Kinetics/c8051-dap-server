@@ -1,0 +1,85 @@
+{
+  "name": "silabs-8051-debug",
+  "displayName": "SiLabs 8051 Debug",
+  "description": "Debug adapter for Silicon Laboratories 8051 MCUs via AGDI / EC3 USB Debug Adapter",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Debuggers"],
+  "activationEvents": ["onDebugResolve:silabs8051"],
+  "main": "./extension.js",
+  "contributes": {
+    "debuggers": [
+      {
+        "type": "silabs8051",
+        "label": "SiLabs 8051 (AGDI)",
+        "languages": [],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program"],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Absolute or workspace-relative path to the Intel HEX file.",
+                "default": "${workspaceFolder}/output/firmware.hex"
+              },
+              "noDebug": {
+                "type": "boolean",
+                "description": "Flash-only mode: program the device without starting a debug session.",
+                "default": false
+              },
+              "noErase": {
+                "type": "boolean",
+                "description": "Skip the flash-erase pass (program + verify only, faster).",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "silabs8051",
+            "request": "launch",
+            "name": "Debug (SiLabs 8051)",
+            "program": "${workspaceFolder}/output/firmware.hex"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "SiLabs 8051: Flash + Debug",
+            "description": "Reset the target and start a live debug session.",
+            "body": {
+              "type": "silabs8051",
+              "request": "launch",
+              "name": "Debug (SiLabs 8051)",
+              "program": "^\"\\${workspaceFolder}/output/firmware.hex\""
+            }
+          },
+          {
+            "label": "SiLabs 8051: Flash Only",
+            "description": "Erase, program and verify the target without opening a debug session.",
+            "body": {
+              "type": "silabs8051",
+              "request": "launch",
+              "name": "Flash Only (SiLabs 8051)",
+              "program": "^\"\\${workspaceFolder}/output/firmware.hex\"",
+              "noDebug": true
+            }
+          },
+          {
+            "label": "SiLabs 8051: Flash Only (no erase)",
+            "description": "Program and verify only — skip the erase pass.",
+            "body": {
+              "type": "silabs8051",
+              "request": "launch",
+              "name": "Flash (no erase)",
+              "program": "^\"\\${workspaceFolder}/output/firmware.hex\"",
+              "noDebug": true,
+              "noErase": true
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
