@@ -46,3 +46,6 @@ silabs_ref/
 # Runtime log output
 *.log
 stderr_log.txt
+
+# Local multi-root workspace file (contains machine-specific paths)
+*.code-workspace
