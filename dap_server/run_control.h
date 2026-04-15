@@ -1,4 +1,7 @@
 // dap_server/run_control.h
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // RunControl — HWND management, AGDI registration chain, run-control wrappers.
 //

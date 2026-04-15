@@ -1,4 +1,6 @@
-"""Test output events: flash SoftStep.hex with noErase and print all DAP output events."""
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 KMI Music, Inc. / Eric Bateman
+"""Test output events: flash a HEX file with noErase and print all DAP output events."""
 import socket, time, json, sys
 sys.stdout.reconfigure(line_buffering=True)
 

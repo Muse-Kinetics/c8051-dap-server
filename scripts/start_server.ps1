@@ -1,3 +1,10 @@
+# scripts/start_server.ps1
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 KMI Music, Inc. / Eric Bateman
+#
+# Launches dap_server.exe in a new console window.
+# Verbose log (DLL internals) is redirected to dap_server.log in the repo root.
+
 $root = "$PSScriptRoot\.."
 $exe = "$root\build\dap_server\bin\Debug\dap_server.exe"
 $log = "$root\dap_server.log"

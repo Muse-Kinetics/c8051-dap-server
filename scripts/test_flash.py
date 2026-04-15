@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 KMI Music, Inc. / Eric Bateman
 """Flash test — send a HEX file to the DAP server for programming."""
 import socket, time, json, sys
 

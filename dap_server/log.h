@@ -1,4 +1,7 @@
 // dap_server/log.h
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // Minimal dual-write logger.
 //

@@ -1,4 +1,7 @@
 // dap_server/run_control.cpp
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // Phase 2: HWND_MESSAGE window creation and AGDI registration chain.
 // Phase 4/5: GoStep / WaitForHalt / SignalHalt.

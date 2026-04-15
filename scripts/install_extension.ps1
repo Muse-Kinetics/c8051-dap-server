@@ -1,6 +1,9 @@
-# install_extension.ps1
+# scripts/install_extension.ps1
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 KMI Music, Inc. / Eric Bateman
+#
 # Installs the silabs-8051-debug extension into VSCode's extensions folder
-# by creating a symlink (no VSIX packaging required).
+# by creating a junction (no VSIX packaging required).
 #
 # Run once; restart VSCode afterwards.
 

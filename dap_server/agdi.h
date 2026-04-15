@@ -1,4 +1,7 @@
 // dap_server/agdi.h
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // AGDI (Advanced GDI) types and constants for the DAP server.
 // Derived from KAN145: Documentation/KAN145/apnt_145ex/SampTarg/AGDI.H

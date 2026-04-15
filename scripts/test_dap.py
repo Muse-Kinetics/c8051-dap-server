@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 KMI Music, Inc. / Eric Bateman
+# Low-level DAP protocol probe — sends initialize and disconnect, prints raw responses.
 import socket, time, json
 
 def send_request(s, seq, command, args=None):

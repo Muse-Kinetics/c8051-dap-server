@@ -1,4 +1,7 @@
 // dap_server/dap_types.h
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // Minimal DAP protocol types and constants for the silicon labs 8051 DAP server.
 // The full DAP specification is at:

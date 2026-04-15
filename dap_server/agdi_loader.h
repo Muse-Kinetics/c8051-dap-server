@@ -1,4 +1,7 @@
 // dap_server/agdi_loader.h
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // AgdiLoader — loads SiC8051F.dll from the same directory as the DAP server exe
 // and resolves all AG_* export function pointers at runtime.

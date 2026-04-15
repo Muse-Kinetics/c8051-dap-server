@@ -1,3 +1,10 @@
+// vscode-extension/extension.js
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
+//
+// Registers a DebugAdapterDescriptorFactory that connects VSCode to the
+// C8051 DAP server running on localhost:4711.
 'use strict';
 const vscode = require('vscode');
 

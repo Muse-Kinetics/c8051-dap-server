@@ -1,4 +1,7 @@
 // dap_server/hex_loader.h
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // HexLoader — parses an Intel HEX file and produces:
 //   - a flat binary image buffer

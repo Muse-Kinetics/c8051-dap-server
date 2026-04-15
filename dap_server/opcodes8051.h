@@ -1,4 +1,7 @@
 // dap_server/opcodes8051.h
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // 256-entry instruction length table for the Intel 8051 architecture.
 // Index = opcode byte value; entry = total instruction length in bytes.

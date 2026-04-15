@@ -1,4 +1,7 @@
 // dap_server/hex_loader.cpp
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // Intel HEX parser producing a flat binary image + FLASHPARM.
 //

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 KMI Music, Inc. / Eric Bateman
 """Erase the target device by flashing an all-0xFF image via the DAP server.
 
 The SiC8051F.dll always erases before programming, so flashing 0xFF bytes

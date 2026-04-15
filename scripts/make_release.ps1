@@ -1,4 +1,7 @@
-# make_release.ps1
+# scripts/make_release.ps1
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 KMI Music, Inc. / Eric Bateman
+#
 # Assembles a self-contained Release\ folder that can be copied into any project.
 #
 # Release layout:

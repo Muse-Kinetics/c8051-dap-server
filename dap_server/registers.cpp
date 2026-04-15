@@ -1,4 +1,7 @@
 // dap_server/registers.cpp
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // Phase 4/7 implementation.  Phase 1–3: stub shell — methods return
 // empty/zero values without crashing.

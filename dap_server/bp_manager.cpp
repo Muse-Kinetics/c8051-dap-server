@@ -1,4 +1,7 @@
 // dap_server/bp_manager.cpp
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // Phase 6 implementation: AG_BP linked list management with AG_BreakFunc calls.
 

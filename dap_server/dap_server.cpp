@@ -1,4 +1,7 @@
 // dap_server/dap_server.cpp
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // Winsock TCP listener with DAP Content-Length framing and command dispatch.
 //

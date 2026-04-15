@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 KMI Music, Inc. / Eric Bateman
 """Phase 4 test: debug launch (noDebug=False).
 
 Expected sequence:

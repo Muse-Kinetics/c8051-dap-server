@@ -1,4 +1,7 @@
 // dap_server/bp_manager.h
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 KMI Music, Inc.
+// Author: Eric Bateman <eric@musekinetics.com>
 //
 // BpManager — manages the AG_BP linked list that the AGDI DLL uses for
 // breakpoint tracking.

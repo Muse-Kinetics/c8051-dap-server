@@ -1,3 +1,12 @@
+# C8051_dap_server — CMakeLists.txt
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 KMI Music, Inc.
+# Author: Eric Bateman <eric@musekinetics.com>
+#
+# Builds dap_server.exe: a Windows DAP server that drives SiC8051F.dll (AGDI)
+# to enable VSCode debugging of Silicon Laboratories C8051F-series MCUs.
+# Requires MSVC x86 (Win32) — the vendor DLL is 32-bit only.
+
 cmake_minimum_required(VERSION 3.20)
 
 project(C8051_dap_server LANGUAGES CXX)
