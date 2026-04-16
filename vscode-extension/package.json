@@ -22,6 +22,10 @@
   "activationEvents": ["onDebugResolve:silabs8051"],
   "main": "./extension.js",
   "contributes": {
+    "breakpoints": [
+      { "language": "c" },
+      { "language": "a51" }
+    ],
     "debuggers": [
       {
         "type": "silabs8051",

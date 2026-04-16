@@ -9,7 +9,7 @@
 
 cmake_minimum_required(VERSION 3.20)
 
-project(C8051_dap_server LANGUAGES CXX)
+project(C8051_dap_server VERSION 0.9.0 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "This project targets Windows only (SiC8051F.dll is a 32-bit Windows DLL).")
@@ -57,10 +57,18 @@ add_executable(dap_server
   "${CMAKE_CURRENT_SOURCE_DIR}/dap_server/bp_manager.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/dap_server/run_control.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/dap_server/registers.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/dap_server/symtab.cpp"
 )
 
 target_include_directories(dap_server PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/dap_server"
+)
+
+target_compile_definitions(dap_server PRIVATE
+  DAP_SERVER_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+  DAP_SERVER_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+  DAP_SERVER_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+  DAP_SERVER_VERSION_STR="${PROJECT_VERSION}"
 )
 
 target_link_libraries(dap_server PRIVATE
@@ -100,3 +108,40 @@ add_custom_command(TARGET dap_server POST_BUILD
           "$<TARGET_FILE_DIR:dap_server>/SiC8051F.wsp"
   COMMENT "Copying SiC8051F.wsp to output directory"
   VERBATIM)
+
+# ---------------------------------------------------------------------------
+# Deploy to SoftStep2/_debugging/bin/ so the firmware project always has
+# the latest server alongside its companion DLLs and config.
+# ---------------------------------------------------------------------------
+set(SOFTSTEP_DEBUG_BIN
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../softstep-firmware/Softstep2/_debugging/bin")
+
+if(EXISTS "${SOFTSTEP_DEBUG_BIN}")
+  message(STATUS "Deploy target: ${SOFTSTEP_DEBUG_BIN}")
+  add_custom_command(TARGET dap_server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:dap_server>"
+            "${SOFTSTEP_DEBUG_BIN}/dap_server.exe"
+    COMMENT "Deploy dap_server.exe -> _debugging/bin/"
+    VERBATIM)
+  add_custom_command(TARGET dap_server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${SILABS_SIC8051F_DLL}"
+            "${SOFTSTEP_DEBUG_BIN}/SiC8051F.dll"
+    COMMENT "Deploy SiC8051F.dll -> _debugging/bin/"
+    VERBATIM)
+  add_custom_command(TARGET dap_server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${SILABS_USBHID_DLL}"
+            "${SOFTSTEP_DEBUG_BIN}/USBHID.dll"
+    COMMENT "Deploy USBHID.dll -> _debugging/bin/"
+    VERBATIM)
+  add_custom_command(TARGET dap_server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/dap_server/SiC8051F.wsp"
+            "${SOFTSTEP_DEBUG_BIN}/SiC8051F.wsp"
+    COMMENT "Deploy SiC8051F.wsp -> _debugging/bin/"
+    VERBATIM)
+else()
+  message(WARNING "SoftStep _debugging/bin not found at ${SOFTSTEP_DEBUG_BIN} — skipping deploy step.")
+endif()

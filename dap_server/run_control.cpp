@@ -106,44 +106,27 @@ static constexpr char kWndClassName[] = "DapServerMsgWnd";
 
 extern "C" U32 DapAgdiCallback(U32 nCode, void* vp)
 {
-    LOGV("DapAgdiCallback: nCode=0x%X vp=%p\n", nCode, vp);
+    // Log all codes so we can see what the DLL actually sends.
+    LOG("[CBK]  nCode=0x%04X vp=%p\n", nCode, vp);
     switch (nCode) {
     case AG_CB_INITREGV:
-        // Extract RG51 register values from the RegDsc structure.
+        // The DLL sends this once during init with a stack-local RegDsc.
+        // The internal pointers (RegArr, RegGet, etc.) reference DLL statics
+        // that persist for the session.  Save a copy of the struct.
         if (vp) {
             RegDsc* rd = static_cast<RegDsc*>(vp);
-            // The DLL fills RegDsc's RegArr with rItem entries.
-            // Each rItem has szVal (ASCII) and v (binary GVAL).
-            // We look for the PC register (isPC==1) and individual SFRs by name.
-            // Also try to populate RG51 directly from the rItem values.
-            RG51 regs{};
-            bool gotPC = false;
-            if (rd->RegArr && rd->nRitems > 0) {
+            g_runControl.SaveRegDsc(rd);
+            LOG("[REGS] Saved RegDsc: nRitems=%d  RegGet=%p  RegArr=%p\n",
+                rd->nRitems, rd->RegGet, rd->RegArr);
+
+            // Dump ALL rItems so we can see the correct nItem IDs for AG_RegAcc.
+            if (rd->RegArr) {
                 for (int i = 0; i < rd->nRitems; ++i) {
                     rItem& ri = rd->RegArr[i];
-                    if (ri.isPC) {
-                        regs.nPC = ri.v.u32;
-                        gotPC = true;
-                    }
-                    // Match register names to RG51 fields
-                    if (_stricmp(ri.szReg, "SP") == 0)   regs.sp  = static_cast<BYTE>(ri.v.u32);
-                    if (_stricmp(ri.szReg, "PSW") == 0)  regs.psw = static_cast<BYTE>(ri.v.u32);
-                    if (_stricmp(ri.szReg, "ACC") == 0 ||
-                        _stricmp(ri.szReg, "A") == 0)    regs.acc = static_cast<BYTE>(ri.v.u32);
-                    if (_stricmp(ri.szReg, "B") == 0)     regs.b   = static_cast<BYTE>(ri.v.u32);
-                    if (_stricmp(ri.szReg, "DPL") == 0)  regs.dpl = static_cast<BYTE>(ri.v.u32);
-                    if (_stricmp(ri.szReg, "DPH") == 0)  regs.dph = static_cast<BYTE>(ri.v.u32);
-                    for (int r = 0; r < 8; ++r) {
-                        char rname[4];
-                        _snprintf_s(rname, sizeof(rname), "R%d", r);
-                        if (_stricmp(ri.szReg, rname) == 0)
-                            regs.Rn[r] = static_cast<BYTE>(ri.v.u32);
-                    }
+                    LOG("[REGS]   [%2d] szReg=%-8s isPC=%d nGi=%d nItem=0x%04X\n",
+                        i, ri.szReg, ri.isPC, ri.nGi, ri.nItem);
                 }
             }
-            g_registers.Update(regs);
-            LOG("[REGS] PC=0x%04X  SP=0x%02X  ACC=0x%02X  PSW=0x%02X  (%d regs)\n",
-                    regs.nPC, regs.sp, regs.acc, regs.psw, rd->nRitems);
         }
         break;
 
@@ -155,6 +138,15 @@ extern "C" U32 DapAgdiCallback(U32 nCode, void* vp)
                 msg.pop_back();
             LOG("[DLL]  %s\n", msg.c_str());
             SendOutput(msg + "\n");
+
+            // The DLL does not reliably call AG_RUNSTOP or PostMessage for step/continue
+            // completion.  "Target Halted" in the message stream is the authoritative
+            // signal that the CPU has stopped.  Use it to unblock WaitForHalt().
+            if (msg.find("Halted") != std::string::npos ||
+                msg.find("halted") != std::string::npos) {
+                LOG("[DEBUG] Halt detected via MSGSTRING — signalling halt event\n");
+                g_runControl.SignalHalt("stopped");
+            }
         }
         break;
 
@@ -277,6 +269,9 @@ extern "C" U32 DapAgdiCallback(U32 nCode, void* vp)
     return AG_OK;
 }
 
+// Forward declaration — defined below in Go/Step section.
+static DWORD CallGoStepSEH(WORD nCode, DWORD nSteps, GADR* pAddr);
+
 // ---------------------------------------------------------------------------
 // Hidden HWND_MESSAGE window
 // ---------------------------------------------------------------------------
@@ -291,6 +286,53 @@ LRESULT CALLBACK RunControl::HwndMsgProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp
         // Only signal if callback hasn't already done so (WaitForHalt is tolerant
         // of double-set because the event is auto-reset only after WaitForHalt).
         g_runControl.SignalHalt("breakpoint");
+        return 0;
+    }
+
+    // WM_USER+2: stop-request posted from the DAP reader thread (HandlePause).
+    // This executes on the main thread (inside the DLL's internal message pump
+    // during AG_GoStep), so calling AG_GoStep(AG_STOPRUN) is safe here.
+    if (msg == WM_USER + 2) {
+        LOG("[DEBUG] HwndMsgProc: stop-request received — calling AG_GoStep(AG_STOPRUN)\n");
+        if (g_agdi.AG_GoStep) {
+            g_agdi.AG_GoStep(AG_STOPRUN, 0, nullptr);
+        }
+        return 0;
+    }
+
+    // WM_USER+3: run-request posted from the DAP reader thread (HandleContinue).
+    // Calls GoStep(AG_GOFORBRK) on the main thread so the reader thread stays
+    // free for receiving DAP messages (e.g. pause).  The DLL's internal message
+    // pump (active while GoStep blocks) will dispatch WM_USER+2 stop-requests.
+    // WM_USER+3: run-request — execute AG_GOFORBRK on the main thread.
+    // This blocks until the target halts (breakpoint or external STOPRUN).
+    // For breakpoint hits the DLL fires AG_CB_INITREGV inside GOFORBRK.
+    // For pause (STOPRUN from reader thread) it does not — the register
+    // refresh is handled separately via WM_USER+4 after StopDirect returns.
+    if (msg == WM_USER + 3) {
+        LOG("[DEBUG] HwndMsgProc: run-request received — calling GoStep(AG_GOFORBRK)\n");
+        if (g_agdi.AG_GoStep) {
+            DWORD exc = CallGoStepSEH(AG_GOFORBRK, 0, nullptr);
+            if (exc) {
+                LOG("[CRASH] SEH exception 0x%08lX in AG_GoStep(AG_GOFORBRK) on main thread\n", exc);
+            } else {
+                LOG("[DEBUG] HwndMsgProc: GoStep(AG_GOFORBRK) returned\n");
+            }
+        }
+        g_runControl.SignalHalt("stopped");
+        return 0;
+    }
+
+    // WM_USER+4: register-refresh request from HandlePause.
+    // By the time this message is dispatched, both GOFORBRK and STOPRUN have
+    // returned, so the DLL is idle and it is safe to issue AG_NSTEP(1).
+    // The single-step triggers AG_CB_INITREGV with the real PC/SP/ACC/PSW.
+    if (msg == WM_USER + 4) {
+        LOG("[DEBUG] HwndMsgProc: register-refresh — AG_NSTEP(1)\n");
+        if (g_agdi.AG_GoStep) {
+            g_agdi.AG_GoStep(AG_NSTEP, 1, nullptr);
+        }
+        g_runControl.SignalHalt("register-refresh");
         return 0;
     }
 
@@ -530,9 +572,11 @@ bool RunControl::InitAgdiSession(bool isFlash, bool noErase)
             return false;
         }
     } else {
-        // Debug tail: add bpHead then reset
-        AG_BP* bpHead = g_bpManager.Head();
-        ret = g_agdi.AG_Init(AGDI_INITBPHEAD, &bpHead);       // 0x030E
+        // Debug tail: register BP list head then reset.
+        // The DLL stores this pointer-to-pointer and dereferences it during
+        // AG_GoStep(AG_GOFORBRK) to walk the breakpoint list.  It must be
+        // the address of a persistent member — NOT a stack local.
+        ret = g_agdi.AG_Init(AGDI_INITBPHEAD, g_bpManager.HeadPtr());  // 0x030E
         LOGV("RunControl: INITBPHEAD returned %u\n", ret);
 
         ResetEvent(m_haltEvent);
@@ -575,7 +619,7 @@ void RunControl::UninitAgdiSession()
 
 bool RunControl::Init()
 {
-    m_haltEvent = CreateEventA(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr);
+    m_haltEvent = CreateEventA(nullptr, /*manualReset=*/TRUE, /*initial=*/FALSE, nullptr);
     return m_haltEvent != nullptr;
 }
 
@@ -599,12 +643,152 @@ void RunControl::Shutdown()
 // Go/Step and halt signalling
 // ---------------------------------------------------------------------------
 
+// SEH wrapper — must be in a plain-C function (no C++ dtors on stack).
+static DWORD CallGoStepSEH(WORD nCode, DWORD nSteps, GADR* pAddr)
+{
+    __try {
+        g_agdi.AG_GoStep(nCode, nSteps, pAddr);
+        return 0;  // success
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+}
+
 bool RunControl::GoStep(WORD nCode, DWORD nSteps, GADR* pAddr)
 {
     if (!g_agdi.AG_GoStep) return false;
     ResetEvent(m_haltEvent);
-    g_agdi.AG_GoStep(nCode, nSteps, pAddr);
+    DWORD exc = CallGoStepSEH(nCode, nSteps, pAddr);
+    if (exc) {
+        LOG("[CRASH] SEH exception 0x%08lX in AG_GoStep(nCode=0x%04X)\n", exc, nCode);
+        return false;
+    }
     return true;
+}
+
+void RunControl::RequestStop()
+{
+    if (m_hwnd) {
+        PostMessage(m_hwnd, WM_USER + 2, 0, 0);
+    }
+}
+
+void RunControl::StopDirect()
+{
+    // Cross-thread call: halt the target by calling AG_GoStep(AG_STOPRUN) directly.
+    // This is called from the reader thread while GoStep(AG_GOFORBRK) is blocking
+    // on the main thread.  The DLL may handle cross-thread STOPRUN by setting a
+    // flag that the main-thread poll loop checks.
+    if (g_agdi.AG_GoStep) {
+        LOG("[DEBUG] StopDirect: calling AG_GoStep(AG_STOPRUN) from reader thread\n");
+        g_agdi.AG_GoStep(AG_STOPRUN, 0, nullptr);
+        LOG("[DEBUG] StopDirect: AG_GoStep(AG_STOPRUN) returned\n");
+    }
+}
+
+void RunControl::RequestRun()
+{
+    if (m_hwnd) {
+        PostMessage(m_hwnd, WM_USER + 3, 0, 0);
+    }
+}
+
+void RunControl::RequestRegRefresh()
+{
+    if (m_hwnd) {
+        PostMessage(m_hwnd, WM_USER + 4, 0, 0);
+    }
+}
+
+void RunControl::ReadRegisters()
+{
+    if (!g_agdi.AG_RegAcc) {
+        LOG("[REGS] ReadRegisters: AG_RegAcc not loaded\n");
+        return;
+    }
+
+    // AG_RegAcc works for PC (mPC=0x500) and R0-R7 (0x00-0x07).
+    // Other registers (ACC, B, SP, DPTR, PSW) return 0 via AG_RegAcc.
+    // Read SFRs directly from DATA memory via AG_MemAcc instead.
+    //   SP=0x81, ACC=0xE0, B=0xF0, PSW=0xD0, DPL=0x82, DPH=0x83
+
+    RG51 regs{};
+    GVAL val{};
+    U32 err;
+
+    // First, call AG_AllReg to ensure DLL's internal state is refreshed.
+    if (g_agdi.AG_AllReg) {
+        err = g_agdi.AG_AllReg(AG_READ, nullptr);
+        LOG("[REGS] AG_AllReg(AG_READ) -> %u\n", err);
+    }
+
+    // PC via AG_RegAcc (mPC = 0x500)
+    val = {};
+    g_agdi.AG_RegAcc(AG_READ, 0x500, &val);
+    regs.nPC = val.u32 & 0xFFFF;
+    LOG("[REGS] PC = 0x%04X\n", regs.nPC);
+
+    // R0-R7 via AG_RegAcc (nReg 0x00..0x07)
+    for (int i = 0; i < 8; ++i) {
+        val = {};
+        g_agdi.AG_RegAcc(AG_READ, i, &val);
+        regs.Rn[i] = val.uc;
+    }
+    LOG("[REGS] R0-R7: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+        regs.Rn[0], regs.Rn[1], regs.Rn[2], regs.Rn[3],
+        regs.Rn[4], regs.Rn[5], regs.Rn[6], regs.Rn[7]);
+
+    // SFRs via AG_MemAcc from DATA space (amDATA=0xF0).
+    // SFR addresses are 0x80-0xFF in the DATA address space.
+    // AGDI encodes memory space in the TOP BYTE of Adr: (mSpace << 24) | offset
+    if (g_agdi.AG_MemAcc) {
+        GADR addr{};
+        addr.mSpace = amDATA;
+        UC8 byte = 0;
+
+        auto ReadSfr = [&](UL32 sfrAddr) -> UC8 {
+            addr.Adr = (static_cast<UL32>(amDATA) << 24) | sfrAddr;
+            byte = 0;
+            U32 merr = g_agdi.AG_MemAcc(AG_READ, &byte, &addr, 1);
+            LOG("[REGS] MemAcc(DATA:0x%02X) -> err=%u val=0x%02X\n", sfrAddr, merr, byte);
+            return byte;
+        };
+
+        regs.sp  = ReadSfr(0x81);  // SP
+        regs.acc = ReadSfr(0xE0);  // ACC
+        regs.b   = ReadSfr(0xF0);  // B
+        regs.psw = ReadSfr(0xD0);  // PSW
+        regs.dpl = ReadSfr(0x82);  // DPL
+        regs.dph = ReadSfr(0x83);  // DPH
+    } else {
+        LOG("[REGS] AG_MemAcc not loaded — falling back to AG_RegAcc for SFRs\n");
+        val = {}; g_agdi.AG_RegAcc(AG_READ, 0x10, &val); regs.acc = val.uc;
+        val = {}; g_agdi.AG_RegAcc(AG_READ, 0x11, &val); regs.b   = val.uc;
+        val = {}; g_agdi.AG_RegAcc(AG_READ, 0x12, &val); regs.sp  = val.uc;
+        val = {}; g_agdi.AG_RegAcc(AG_READ, 0x100,&val); regs.psw = val.uc;
+        val = {};
+        g_agdi.AG_RegAcc(AG_READ, 0x13, &val);
+        regs.dpl = static_cast<BYTE>(val.u16 & 0xFF);
+        regs.dph = static_cast<BYTE>((val.u16 >> 8) & 0xFF);
+    }
+
+    g_registers.Update(regs);
+    LOG("[REGS] FINAL: PC=0x%04X SP=0x%02X ACC=0x%02X PSW=0x%02X B=0x%02X DPH:DPL=%02X:%02X\n",
+        regs.nPC, regs.sp, regs.acc, regs.psw, regs.b, regs.dph, regs.dpl);
+}
+
+void RunControl::SaveRegDsc(const RegDsc* rd)
+{
+    if (!rd) return;
+    m_savedRegDsc = *rd;   // shallow copy — internal pointers reference DLL statics
+    m_hasRegDsc = true;
+}
+
+void RunControl::ResetHaltEvent()
+{
+    if (m_haltEvent) {
+        ResetEvent(m_haltEvent);
+    }
 }
 
 bool RunControl::WaitForHalt(DWORD timeoutMs)

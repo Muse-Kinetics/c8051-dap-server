@@ -7,6 +7,7 @@
 // empty/zero values without crashing.
 
 #include "registers.h"
+#include "symtab.h"
 
 #include <cstring>
 #include <iomanip>
@@ -67,7 +68,6 @@ nlohmann::json RegisterCache::ToVariables() const
             {"name",               name},
             {"value",              value},
             {"variablesReference", 0},
-            {"type",               "uint8"},
         });
     };
 
@@ -90,11 +90,41 @@ nlohmann::json RegisterCache::ToStackFrame(int frameId) const
     std::lock_guard<std::mutex> lock(m_mutex);
     uint32_t pc = m_valid ? m_regs.nPC : 0u;
 
+    // Try line-level source info first, then fall back to symbol name.
+    auto loc = g_symtab.LookupLine(pc);
+    if (loc) {
+        nlohmann::json frame = {
+            {"id",     frameId},
+            {"name",   g_symtab.LookupSymbol(pc).empty()
+                           ? HexDword(pc)
+                           : g_symtab.LookupSymbol(pc)},
+            {"source", {{"path", loc->file}, {"presentationHint", "normal"}}},
+            {"line",   loc->line},
+            {"column", 1},
+        };
+        return frame;
+    }
+
+    // Line-level not available — try function-name-only from symbol table.
+    std::string sym = g_symtab.LookupSymbol(pc);
+    if (!sym.empty()) {
+        return {
+            {"id",     frameId},
+            {"name",   sym},
+            {"source", {{"name", "8051.asm"}, {"sourceReference", 0}, {"presentationHint", "deemphasize"}}},
+            {"line",   1},
+            {"column", 1},
+            {"instructionReference", HexDword(pc)},
+        };
+    }
+
+    // Fallback: bare hex address, no source.
     return {
         {"id",     frameId},
         {"name",   HexDword(pc)},
-        {"line",   0},
-        {"column", 0},
-        // No source — the hex address is meaningful without source mapping
+        {"source", {{"name", "8051.asm"}, {"sourceReference", 0}, {"presentationHint", "deemphasize"}}},
+        {"line",   1},
+        {"column", 1},
+        {"instructionReference", HexDword(pc)},
     };
 }

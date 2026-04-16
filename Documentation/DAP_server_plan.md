@@ -6,8 +6,8 @@ Build a Windows x86 DAP server that loads `SiC8051F.dll` directly, drives it thr
 the fully-decoded AGDI API, and serves the Microsoft Debug Adapter Protocol over TCP.
 A VSCode extension registers a `DebugAdapterDescriptorFactory` that connects to port 4711.
 
-**Status: All 8 phases complete and hardware-verified.** See agent_setup_guide.md for
-current known issues and the recommended development workflow.
+**Status: Phases 1–8 complete and hardware-verified. Phase 9 (source-level debug) in progress.**
+See `DAP_implementation_status.md` for detailed feature matrix and open bugs.
 
 This replaces the earlier GDB RSP concept. No GDB layer is involved.
 
@@ -153,10 +153,11 @@ background thread also receives `PostMessage(hWnd, msgToken, ...)` as a secondar
 | 3b | DAP `output` events from DLL messages | ✅ Complete — HW verified |
 | 3c | Flash progress dialog suppression | ✅ Complete |
 | 4 | Debug launch, halt at reset vector | ✅ Complete — HW verified |
-| 5 | Run control (continue / step / pause) | ✅ Complete — HW verified (continue has firmware issue, see Known Issues) |
-| 6 | Breakpoints | ✅ Complete — HW tested |
+| 5 | Run control (continue / step / pause) | ✅ Complete — continue HW verified; step/pause have open bugs |
+| 6 | Breakpoints | ✅ Complete — address BPs HW tested; source BPs need line info |
 | 7 | Register and memory read, scopes | ✅ Complete — HW verified |
 | 8 | VSCode extension | ✅ Complete — working |
+| 9 | Source-level debug (symtab, line mapping) | 🔧 In progress — m51 symbols loaded; OMF line info TBD |
 
 **Clean reconnect:** Fixed. Root cause was `byte_101DDF9C` internal DLL flag persisting
 across UNINIT within the same process. Fix: `FreeLibrary` + `LoadLibrary` in
@@ -479,89 +480,42 @@ already running), flashes the device, and the VSCode debugger UI attaches.
 
 ---
 
-## Current State (April 2026)
+## Current State (April 15, 2026)
 
 ### What Has Been Hardware-Verified
 
-- **Phase 1–2:** TCP framing, DLL load, full AGDI registration chain, INITFEATURES=0
-  (successful connection) — all confirmed on real hardware with EC3 + C8051F380 EVB.
+- **Phase 1–8:** All phases complete and HW-verified. See phase status table above.
+- **Phase 9 (source-level debug):** In progress. See `phase9_source_debug.md`.
+- **Version:** `v0.9.0` with build timestamp in splash.
+- **Deploy pipeline:** CMake post-build copies DLLs + exe to both
+  `build/dap_server/bin/Debug/` and `../../softstep-firmware/Softstep2/_debugging/bin/`.
 
-- **Phase 3 — Flash (erase+program+verify):** DAP `launch` with a HEX file path
-  successfully flashes the target. Confirmed with `SoftStep_Bootloader.hex`.
+### Hardware-Verified Session Flow (April 15, 2026)
 
-- **Phase 3a — `noErase` launch arg:** `"noErase": true` in the launch request passes
-  `Opt = 0x0600` (FLASH_PROGRAM | FLASH_VERIFY) via `AG_CB_GETBOMPTR`, bypassing the
-  erase phase. Hardware-verified: SoftStep app (54 kB at 0x2400) flashed on top of the
-  bootloader; device booted the application.
+Full debug session tested with SoftStep2 firmware + EC3 + C8051F380:
+1. F5 → flash + debug launch → target halts at PC=0x0000 ✅
+2. Continue (F5) → target runs, firmware boots, device responsive ✅
+3. WDT disable (0xDE/0xAD to WDTCN SFR 0x97) before continue ✅
+4. DLL callbacks received and logged with `[CBK]` prefix ✅
+5. `output` events displayed in VS Code Debug Console ✅
+6. Clean disconnect + re-launch works (DLL unload/reload cycle) ✅
 
-- **Phase 3b — DAP `output` events:** `AG_CB_MSGSTRING` messages (e.g. "Connecting…",
-  progress strings) are forwarded to the DAP client as `output` events. Confirmed in
-  test output — "Connecting..." appeared in the client stream.
+### Active Issues
 
-- **Phase 3c — Dialog suppression:** Flash progress dialog patched silent via two IAT
-  hooks in `SiC8051F.dll`'s IAT:
-  - ShowWindow at RVA 0x843B8 — SW_SHOW redirected to SW_HIDE
-  - MessageBoxA at RVA 0x84440 — forwarded as `output` event, returns IDOK
-  - ShowDialog internal function patched to RET at RVA 0x319B0
-
-### Active Blocker: Clean Reconnect
-
-After a successful flash + UNINIT, the next launch request fails with
-`INITFEATURES = 1` ("target not connected") even after replug of the USB adapter.
-The DLL prints "SiC8051F: Connecting..." (USB side is up) but C2 bus connect fails.
-
-**Confirmed facts:**
-- The EC3 adapter USB side is enumerated — the `-UEC3XXXXXXXX` serial appears in
-  MonPath and GETBOMPTR fires.
-- The DLL's `sub_100052E0` (UNINIT slow teardown) runs for ~90 s when
-  `byte_101DDF9C == 0` (first UNINIT after process start).
-- After that 90 s wait, the subsequent connect still fails unless the EC3 debug
-  connector is physically re-seated on the target board.
-- The target device is running firmware and its C2 pins are accessible.
-
-**Likely causes (not yet eliminated):**
-1. The EC3 debug connector (not USB) is not physically connected to the target header
-   during testing — this is the simplest explanation and must be confirmed first.
-2. The `sub_100052E0` teardown leaves the C2 bus in a state requiring physical
-   reset/replug of the debug connector rather than just the USB.
-3. `Opt = 0x600` in `AG_CB_GETBOMPTR` during the connect phase (before flash) may
-   alter connection behaviour — needs isolation test with `Opt = 0` at connect time.
-
-**Next diagnostic step:** Ensure EC3 debug header is physically seated, then run a
-fresh connect attempt. If INITFEATURES still returns 1, try with `noErase = false`
-(which sets `Opt = 0`) to isolate whether Opt affects INITFEATURES.
-
-### Phases 4–7: Implementation Complete, Not Yet HW Tested
-
-All code for debug launch, run control, breakpoints, and register/memory read is
-implemented and compiles. Hardware testing is gated on resolving the clean-reconnect
-blocker above.
-
----
-
-## Key Open Questions (Non-Blocking for Phase 1–2)
-
-| Question | When it matters | Notes |
-|---|---|---|
-| `RegisterWindowMessage` name string | Phase 2 bringup | Callback `pCBF` path works without it; the message-window path is secondary |
-| `FLASHPARM` exact field offsets | Phase 3 bringup | Struct known from AGDI.H; verify against DLL behaviour |
-| Which `AG_INITITEM` codes can be omitted | Phase 2 bringup | Stub or skip codes not supported by this DLL; observe DLL output |
-| Same-session flash-then-debug crash | Deferred | Restart DAP server between sessions as workaround |
-| Clean reconnect without replug | Active blocker | UNINIT slow teardown leaves adapter in state requiring physical re-seat of debug connector; root cause not yet fully isolated |
-| `Opt=0x600` effect on INITFEATURES | Under investigation | Setting Opt at connection time (GETBOMPTR) may alter DLL connection logic; needs isolation test |
-| `sub_100052E0` timeout | Known | ~90 s USB teardown in SiC8051F.dll when byte_101DDF9C==0; patching the internal wait is a future optimisation once clean reconnect is solved |
+See `DAP_implementation_status.md` for the full list of open bugs and TODO items.
 
 ---
 
 ## Phased Go/No-Go Summary
 
-| Phase | Minimum acceptance criterion |
-|---|---|
-| 1 | `initialize` + `disconnect` round-trip over TCP; valid `capabilities` JSON |
-| 2 | DLL loads; registration chain completes; AGDI log shows `"Attempting Connection."` |
-| 3 | Target programmed via DAP `launch`; bytes confirmed on device |
-| 4 | Registers panel shows `RG51` values; `nPC = 0x0000` at reset vector |
-| 5 | F5 / F10 / F11 work against live hardware |
-| 6 | Breakpoint fires; `nPC` matches BP address |
-| 7 | All 5 scopes readable; memory values correct |
-| 8 | F5 from VSCode with `launch.json`; full flash-and-debug session |
+| Phase | Minimum acceptance criterion | Status |
+|---|---|---|
+| 1 | `initialize` + `disconnect` round-trip over TCP; valid `capabilities` JSON | ✅ |
+| 2 | DLL loads; registration chain completes; AGDI log shows `"Attempting Connection."` | ✅ |
+| 3 | Target programmed via DAP `launch`; bytes confirmed on device | ✅ |
+| 4 | Registers panel shows `RG51` values; `nPC = 0x0000` at reset vector | ✅ |
+| 5 | F5 / F10 / F11 work against live hardware | ✅ (continue), ⚠️ (step/pause — see bugs) |
+| 6 | Breakpoint fires; `nPC` matches BP address | ⚠️ (address BPs work; source BPs need line info) |
+| 7 | All 5 scopes readable; memory values correct | ✅ |
+| 8 | F5 from VSCode with `launch.json`; full flash-and-debug session | ✅ |
+| 9 | Source-level stepping with C line highlight | 🔧 In progress |

@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "debug-mcp": {
+      "type": "sse",
+      "url": "http://127.0.0.1:6009/sse"
+    }
+  }
+}

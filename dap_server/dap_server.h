@@ -70,6 +70,7 @@ private:
     void HandleLaunch          (int seq, const nlohmann::json& args);
     void HandleDisconnect      (int seq, const nlohmann::json& args);
     void HandleSetBreakpoints  (int seq, const nlohmann::json& args);
+    void HandleSetExceptionBreakpoints(int seq, const nlohmann::json& args);
     void HandleThreads         (int seq, const nlohmann::json& args);
     void HandleContinue        (int seq, const nlohmann::json& args);
     void HandleNext            (int seq, const nlohmann::json& args);
@@ -87,6 +88,7 @@ private:
     std::atomic<int>  m_seq{1};
     std::mutex        m_sendMutex;
     std::atomic<bool> m_disconnecting{false};
+    bool               m_pendingEntryStop{false};
 
     int NextSeq() { return m_seq.fetch_add(1); }
 };

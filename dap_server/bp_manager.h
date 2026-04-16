@@ -45,6 +45,10 @@ public:
     // Returns a pointer to the list head for passing to AGDI_INITBPHEAD.
     AG_BP* Head() { return m_head; }
 
+    // Returns the address of the list head pointer — the DLL stores this
+    // and dereferences it on every AG_GoStep(AG_GOFORBRK) to walk the list.
+    AG_BP** HeadPtr() { return &m_head; }
+
 private:
     AG_BP  m_pool[kMaxBreakpoints];
     AG_BP *m_head = nullptr;  // list head (may be nullptr for empty list)

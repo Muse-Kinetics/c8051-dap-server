@@ -36,7 +36,8 @@ static void ServerThread()
 int main()
 {
     LOG("========================================\n");
-    LOG("  Silabs 8051 DAP Server  (Debug build)\n");
+    LOG("  Silabs 8051 DAP Server  v%s\n", DAP_SERVER_VERSION_STR);
+    LOG("  Built: %s %s\n", __DATE__, __TIME__);
     LOG("  AGDI backend: SiC8051F.dll\n");
     LOG("  DAP port:     %d\n", kDapPort);
     LOG("========================================\n");

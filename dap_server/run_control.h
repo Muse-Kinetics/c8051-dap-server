@@ -78,6 +78,35 @@ public:
     bool               IsSessionActive() const { return m_sessionActive; }
     bool               IsNoErase()       const { return m_noErase; }
 
+    // Post a stop-request to the HWND.  Safe to call from any thread.
+    // The HwndMsgProc will call AG_GoStep(AG_STOPRUN) on the AGDI thread.
+    void RequestStop();
+
+    // Call AG_GoStep(AG_STOPRUN) directly from the calling thread.
+    // Used by HandlePause on the reader thread as a cross-thread stop.
+    void StopDirect();
+
+    // Post a run-request (AG_GOFORBRK) to the HWND.  GoStep executes on the
+    // main thread so the caller's thread stays free for DAP I/O.
+    // Call ResetHaltEvent() before this, then WaitForHalt() to detect completion.
+    void RequestRun();
+
+    // Post a register-refresh request (AG_NSTEP(1)) to the main thread.
+    // Used by HandlePause after StopDirect returns to trigger AG_CB_INITREGV.
+    void RequestRegRefresh();
+
+    // Read registers from hardware using AG_AllReg + saved RegDsc.
+    // Must be called when the target is halted.
+    void ReadRegisters();
+
+    // Save the RegDsc passed in the AG_CB_INITREGV callback.
+    // The struct is a stack local in the DLL, but its internal pointers
+    // (RegArr, GrpArr, RegGet, RegSet) reference DLL statics that persist.
+    void SaveRegDsc(const RegDsc* rd);
+
+    // Reset the halt event before starting a new run cycle.
+    void ResetHaltEvent();
+
     // DoEvents stub: DLL calls this pointer periodically during flash/debug ops.
     // Implementation must not block.
     static void AgdiDoEvents() {}
@@ -109,6 +138,10 @@ private:
     bool        m_noErase       = false;
     bool        m_isFlashOnly   = false;
     std::string m_haltReason    = "entry";
+
+    // Saved copy of the RegDsc from AG_CB_INITREGV callback.
+    RegDsc      m_savedRegDsc{};
+    bool        m_hasRegDsc     = false;
 };
 
 // ---------------------------------------------------------------------------

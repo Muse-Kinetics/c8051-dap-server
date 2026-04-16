@@ -19,6 +19,7 @@
 #include "bp_manager.h"
 #include "registers.h"
 #include "hex_loader.h"
+#include "symtab.h"
 #include "opcodes8051.h"
 #include "log.h"
 
@@ -33,6 +34,12 @@
 // Global DapServer pointer — set during RunSession, used by run-control
 // helpers to send asynchronous stopped events from background threads.
 DapServer* g_pServer = nullptr;
+
+// Generation counter — incremented each time the target is resumed.
+// Background threads capture the current value before waiting; if it has
+// changed by the time WaitForHalt returns, the wait is stale and the
+// stopped event must NOT be sent (a newer command owns the halt).
+static std::atomic<uint32_t> g_runGeneration{0};
 
 // ---------------------------------------------------------------------------
 // Construction / destruction
@@ -139,10 +146,22 @@ bool DapServer::RunSession()
         return false;
     }
 
-    nlohmann::json msg;
-    while (!m_disconnecting && RecvMessage(msg)) {
-        Dispatch(msg);
-    }
+    // Spawn a reader thread that receives DAP messages and dispatches them.
+    // This allows the worker thread to block inside AG_GoStep(AG_GOFORBRK)
+    // while the reader thread can still receive new commands (e.g. pause).
+    std::thread reader([this]() {
+        nlohmann::json msg;
+        while (!m_disconnecting && RecvMessage(msg)) {
+            Dispatch(msg);
+        }
+        // If the reader exits (client disconnected or error), signal the
+        // worker thread in case it's blocked in WaitForHalt.
+        m_disconnecting = true;
+        g_runControl.RequestStop();
+    });
+
+    // This thread waits for the reader to finish.
+    reader.join();
 
     closesocket(m_clientSock);
     m_clientSock = INVALID_SOCKET;
@@ -232,6 +251,21 @@ void DapServer::SendMessage(const nlohmann::json& msg)
     std::string body = msg.dump();
     std::string frame = "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 
+    // Log every outgoing DAP message for debugging (use LOGV to avoid
+    // recursion — LOG calls DapLogSend → SendEvent → SendMessage → LOG …)
+    std::string type = msg.value("type", "?");
+    if (type == "response") {
+        LOGV("[WIRE] -> response cmd=%s req_seq=%d success=%s body_size=%d\n",
+            msg.value("command", "?").c_str(),
+            msg.value("request_seq", -1),
+            msg.value("success", false) ? "true" : "false",
+            (int)body.size());
+    } else if (type == "event") {
+        std::string ev = msg.value("event", "?");
+        if (ev != "output")   // suppress output-event logging (chatty)
+            LOGV("[WIRE] -> event %s\n", ev.c_str());
+    }
+
     std::lock_guard<std::mutex> lock(m_sendMutex);
     if (m_clientSock == INVALID_SOCKET) return;
 
@@ -284,6 +318,25 @@ void DapServer::SendEvent(const std::string& eventName, const nlohmann::json& bo
 }
 
 // ---------------------------------------------------------------------------
+// DapLogSend — routes LOG() text to VS Code Debug Console via DAP output
+// ---------------------------------------------------------------------------
+void DapLogSend(const char* fmt, ...)
+{
+    if (!g_pServer) return;
+
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    g_pServer->SendEvent("output", {
+        {"category", "console"},
+        {"output",   buf},
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Command dispatch
 // ---------------------------------------------------------------------------
 
@@ -303,8 +356,9 @@ void DapServer::Dispatch(const nlohmann::json& msg)
     else if (command == "launch")            HandleLaunch           (seq, args);
     else if (command == "disconnect")        HandleDisconnect       (seq, args);
     else if (command == "terminate")         HandleDisconnect       (seq, args);
-    else if (command == "setBreakpoints")    HandleSetBreakpoints   (seq, args);
-    else if (command == "threads")           HandleThreads          (seq, args);
+    else if (command == "setBreakpoints")          HandleSetBreakpoints         (seq, args);
+    else if (command == "setExceptionBreakpoints")   HandleSetExceptionBreakpoints(seq, args);
+    else if (command == "threads")                    HandleThreads                (seq, args);
     else if (command == "continue")          HandleContinue         (seq, args);
     else if (command == "next")              HandleNext             (seq, args);
     else if (command == "stepIn")            HandleStepIn           (seq, args);
@@ -339,8 +393,22 @@ void DapServer::HandleInitialize(int seq, const nlohmann::json& /*args*/)
 
 void DapServer::HandleConfigurationDone(int seq, const nlohmann::json& /*args*/)
 {
-    // Breakpoints have been delivered; no action needed until Phase 6.
     SendResponse(seq, "configurationDone");
+
+    // Now that the client has finished configuration, send the deferred
+    // entry-stop event.  A short delay ensures the response is flushed
+    // to the client before the event arrives (matches mudap pattern).
+    if (m_pendingEntryStop) {
+        m_pendingEntryStop = false;
+        std::thread([this]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            SendEvent("stopped", {
+                {"reason",            "step"},
+                {"threadId",          kThreadId},
+                {"allThreadsStopped", true},
+            });
+        }).detach();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -351,9 +419,15 @@ void DapServer::HandleDisconnect(int seq, const nlohmann::json& /*args*/)
 {
     // Clean up the AGDI session before disconnecting.
     if (g_runControl.IsSessionActive()) {
+        // If the target is running (GoStep blocking on the main thread), stop
+        // it first.  Without this the DLL crashes when AG_Init(AGDI_UNINIT) is
+        // called while GoStep is still active.
+        ++g_runGeneration;              // suppress stale WaitAndSendStopped
+        g_runControl.StopDirect();      // halt target (no-op if already halted)
         g_runControl.UninitAgdiSession();
     }
     g_hexLoader.Unload();
+    g_symtab.Clear();
 
     SendResponse(seq, "disconnect");
     m_disconnecting = true;
@@ -396,6 +470,11 @@ void DapServer::HandleLaunch(int seq, const nlohmann::json& args)
     LOG("[HEX]  Loaded %u bytes at base 0x%04X\n",
         g_hexLoader.ByteCount(), g_hexLoader.BaseAddress());
 
+    // Load symbol table for source-level debugging (optional — no-op if files absent).
+    if (!isFlash) {
+        g_symtab.Load(hexPath);
+    }
+
     // Run the AGDI registration chain.
     if (!g_runControl.InitAgdiSession(isFlash, noErase)) {
         LOG("[ERROR] AGDI session init failed\n");
@@ -413,16 +492,17 @@ void DapServer::HandleLaunch(int seq, const nlohmann::json& args)
             LOGV("HandleLaunch: timeout waiting for reset halt\n");
         }
 
+        g_runControl.ReadRegisters();
         uint32_t pc = g_registers.PC();
         LOG("[DEBUG] Target halted at PC=0x%04X\n", pc);
 
-        SendEvent("stopped", {
-            {"reason",            "entry"},
-            {"threadId",          kThreadId},
-            {"allThreadsStopped", true},
-        });
+        // Defer the stopped event until configurationDone (DAP protocol
+        // requirement — the client ignores stopped events received before
+        // configurationDone has been acknowledged).
+        m_pendingEntryStop = true;
     } else {
         g_hexLoader.Unload();
+        g_symtab.Clear();
         LOG("[LAUNCH] Flash complete — session terminated\n");
         SendEvent("terminated", nlohmann::json(nullptr));
     }
@@ -431,21 +511,55 @@ void DapServer::HandleLaunch(int seq, const nlohmann::json& args)
 void DapServer::HandleSetBreakpoints(int seq, const nlohmann::json& args)
 {
     // Extract breakpoint addresses from the request.
-    // DAP sends: { source: { path: ... }, breakpoints: [ { line: N }, ... ] }
-    // For a bare-metal 8051 debug adapter with no source mapping, we accept
-    // an extension field 'address' (hex string) on each breakpoint.
-    // If only 'line' is provided, we treat it as a CODE address (for now).
+    // DAP sends: { source: { path: "..." }, breakpoints: [ { line: N }, ... ] }
+    //
+    // Resolution order for each breakpoint:
+    //   1. 'address' field (explicit hex string) — raw code address, always honoured.
+    //   2. 'line' field + source.path  — resolved via the symbol table line map.
+    //   3. 'line' field alone (no source path) — treated as a raw code address
+    //      (legacy behaviour, useful before source mapping is available).
     std::vector<uint32_t> addresses;
     nlohmann::json verified = nlohmann::json::array();
+
+    // Source file path from the top-level 'source' object (applies to all BPs).
+    std::string sourcePath;
+    if (args.contains("source") && args["source"].is_object()) {
+        sourcePath = args["source"].value("path", "");
+    }
 
     if (args.contains("breakpoints") && args["breakpoints"].is_array()) {
         for (auto& bp : args["breakpoints"]) {
             uint32_t addr = 0;
+            bool resolved = false;
+
             if (bp.contains("address") && bp["address"].is_string()) {
-                addr = static_cast<uint32_t>(std::stoul(bp["address"].get<std::string>(), nullptr, 0));
-            } else if (bp.contains("line") && bp["line"].is_number_integer()) {
-                addr = static_cast<uint32_t>(bp["line"].get<int>());
+                // Explicit hex address override.
+                try {
+                    addr = static_cast<uint32_t>(
+                        std::stoul(bp["address"].get<std::string>(), nullptr, 0));
+                    resolved = true;
+                } catch (...) {}
             }
+
+            if (!resolved && bp.contains("line") && bp["line"].is_number_integer()) {
+                int line = bp["line"].get<int>();
+
+                // Try symbol table lookup if we have a source path.
+                if (!sourcePath.empty() && g_symtab.IsLoaded()) {
+                    auto maybeAddr = g_symtab.LookupAddress(sourcePath, line);
+                    if (maybeAddr) {
+                        addr = *maybeAddr;
+                        resolved = true;
+                        LOG("[BP]   %s:%d -> 0x%04X\n", sourcePath.c_str(), line, addr);
+                    }
+                }
+
+                if (!resolved) {
+                    // Fallback: treat line number as a raw code address.
+                    addr = static_cast<uint32_t>(line);
+                }
+            }
+
             addresses.push_back(addr);
         }
     }
@@ -469,6 +583,12 @@ void DapServer::HandleSetBreakpoints(int seq, const nlohmann::json& args)
     SendResponse(seq, "setBreakpoints", {{"breakpoints", verified}});
 }
 
+void DapServer::HandleSetExceptionBreakpoints(int seq, const nlohmann::json& /*args*/)
+{
+    // No exception breakpoints on bare-metal 8051 — acknowledge as empty.
+    SendResponse(seq, "setExceptionBreakpoints", {{"breakpoints", nlohmann::json::array()}});
+}
+
 void DapServer::HandleThreads(int seq, const nlohmann::json& /*args*/)
 {
     // Single MCU thread always present.
@@ -482,11 +602,21 @@ void DapServer::HandleThreads(int seq, const nlohmann::json& /*args*/)
 // Helper: wait for halt on a background thread and send a DAP stopped event.
 // ---------------------------------------------------------------------------
 
-static void WaitAndSendStopped(const std::string& reason)
+static void WaitAndSendStopped(const std::string& reason, uint32_t gen)
 {
     if (!g_runControl.WaitForHalt(30000)) {
         LOG("[DEBUG] Timeout waiting for halt (%s)\n", reason.c_str());
     }
+
+    // If a newer run command has been issued while we waited, this halt
+    // belongs to a different resume cycle — discard silently.
+    if (g_runGeneration.load() != gen) {
+        LOG("[DEBUG] Stale halt (gen %u vs current %u) — suppressed\n",
+            gen, g_runGeneration.load());
+        return;
+    }
+
+    g_runControl.ReadRegisters();
     uint32_t pc = g_registers.PC();
     LOG("[DEBUG] Halted at PC=0x%04X  reason=%s\n", pc, reason.c_str());
 
@@ -504,10 +634,41 @@ void DapServer::HandleContinue(int seq, const nlohmann::json& /*args*/)
     nlohmann::json body = {{"allThreadsContinued", true}};
     SendResponse(seq, "continue", body);
 
-    // Issue AG_GOFORBRK: run until a breakpoint fires.
-    if (g_runControl.GoStep(AG_GOFORBRK, 0, nullptr)) {
-        std::thread(WaitAndSendStopped, kStopReasonBreakpoint).detach();
+    // Attempt to disable the C8051F380 watchdog timer before releasing the CPU.
+    // The WDT has a default timeout of ~95ms after a debug reset, which is shorter
+    // than the firmware's hardware initialization sequence.  If the WDT fires before
+    // the firmware pets it, the CPU resets and AG_RUNSTOP never fires, causing a
+    // 30-second timeout on this side.
+    //
+    // WDTCN SFR on C8051F380 is at address 0x97 (DATA/SFR space).
+    // Disable sequence: write 0xDE then 0xAD to WDTCN.
+    // Note: the debug interface writes are not guaranteed to be back-to-back
+    // within one clock cycle, so the WDT may not accept the disable.  This is
+    // a best-effort attempt; the firmware's own WDT init will take over if it
+    // succeeds in running past initialization.
+    if (g_agdi.AG_MemAcc) {
+        constexpr uint16_t WDTCN_SFR = 0x97;   // C8051F380 watchdog control SFR
+        GADR wdtAddr{};
+        wdtAddr.Adr    = (static_cast<UL32>(amDATA) << 24) | WDTCN_SFR;
+        wdtAddr.nLen   = 1;
+        wdtAddr.mSpace = amDATA;
+
+        UC8 wdtDisable1 = 0xDE;
+        UC8 wdtDisable2 = 0xAD;
+        g_agdi.AG_MemAcc(AG_WRITE, &wdtDisable1, &wdtAddr, 1);
+        g_agdi.AG_MemAcc(AG_WRITE, &wdtDisable2, &wdtAddr, 1);
+        LOG("[DEBUG] WDT disable sequence written to WDTCN (0x%02X)\n", WDTCN_SFR);
     }
+
+    // Post AG_GOFORBRK to the main thread so the reader thread stays free
+    // for receiving DAP messages (e.g. pause).  The main thread's GoStep call
+    // blocks inside the DLL's internal message pump, which will dispatch our
+    // WM_USER+2 stop-request when HandlePause fires.
+    LOG("[DEBUG] Posting GoStep(AG_GOFORBRK) to main thread...\n");
+    g_runControl.ResetHaltEvent();
+    g_runControl.RequestRun();
+    uint32_t gen = ++g_runGeneration;
+    std::thread(WaitAndSendStopped, kStopReasonBreakpoint, gen).detach();
 }
 
 void DapServer::HandleNext(int seq, const nlohmann::json& /*args*/)
@@ -532,7 +693,8 @@ void DapServer::HandleNext(int seq, const nlohmann::json& /*args*/)
     target.mSpace = amCODE;
 
     if (g_runControl.GoStep(AG_GOTILADR, 0, &target)) {
-        std::thread(WaitAndSendStopped, kStopReasonStep).detach();
+        uint32_t gen = ++g_runGeneration;
+        std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
     }
 }
 
@@ -542,15 +704,37 @@ void DapServer::HandleStepIn(int seq, const nlohmann::json& /*args*/)
 
     // Single-step: execute one instruction.
     if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
-        std::thread(WaitAndSendStopped, kStopReasonStep).detach();
+        uint32_t gen = ++g_runGeneration;
+        std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
     }
 }
 
 void DapServer::HandlePause(int seq, const nlohmann::json& /*args*/)
 {
-    // Force-stop the running target.
-    g_runControl.GoStep(AG_STOPRUN, 0, nullptr);
+    // Synchronous pause (java-debug pattern):
+    //  1. Send DAP response immediately.
+    //  2. Increment generation to suppress the stale continue-waiter.
+    //  3. StopDirect() — blocks until AG_STOPRUN returns.  By that time
+    //     GOFORBRK has also returned on the main thread, so the DLL is idle.
+    //  4. Post WM_USER+4 to main thread for AG_NSTEP(1) register refresh.
+    //  5. WaitForHalt — NSTEP triggers AG_CB_INITREGV with real registers.
+    //  6. Send StoppedEvent with valid PC.
     SendResponse(seq, "pause");
+    LOG("[DEBUG] HandlePause: requesting target stop\n");
+    ++g_runGeneration;                       // kill stale continue-waiter
+    g_runControl.StopDirect();               // synchronous halt
+    LOG("[DEBUG] HandlePause: StopDirect returned — reading registers\n");
+
+    g_runControl.ReadRegisters();            // active register read via RegDsc
+
+    uint32_t pc = g_registers.PC();
+    LOG("[DEBUG] HandlePause: halted at PC=0x%04X\n", pc);
+
+    SendEvent("stopped", {
+        {"reason",            kStopReasonPause},
+        {"threadId",          kThreadId},
+        {"allThreadsStopped", true},
+    });
 }
 
 void DapServer::HandleStackTrace(int seq, const nlohmann::json& /*args*/)
@@ -566,18 +750,18 @@ void DapServer::HandleStackTrace(int seq, const nlohmann::json& /*args*/)
 
 void DapServer::HandleScopes(int seq, const nlohmann::json& args)
 {
-    // Scope variablesReference IDs:
-    //   1 = Registers
-    //   2 = CODE memory
-    //   3 = XDATA memory
-    //   4 = DATA memory
-    //   5 = IDATA memory
+    // Scope variablesReference IDs (use 100+ to avoid collision with frame IDs):
+    //   100 = Registers
+    //   101 = CODE memory
+    //   102 = XDATA memory
+    //   103 = DATA memory
+    //   104 = IDATA memory
     nlohmann::json scopes = {
-        {{"name", "Registers"}, {"variablesReference", 1}, {"expensive", false}},
-        {{"name", "CODE"},      {"variablesReference", 2}, {"expensive", true}},
-        {{"name", "XDATA"},     {"variablesReference", 3}, {"expensive", true}},
-        {{"name", "DATA"},      {"variablesReference", 4}, {"expensive", true}},
-        {{"name", "IDATA"},     {"variablesReference", 5}, {"expensive", true}},
+        {{"name", "Registers"}, {"presentationHint", "locals"},    {"variablesReference", 100}, {"expensive", false}},
+        {{"name", "CODE"},      {"presentationHint", "registers"}, {"variablesReference", 101}, {"expensive", true}},
+        {{"name", "XDATA"},     {"presentationHint", "registers"}, {"variablesReference", 102}, {"expensive", true}},
+        {{"name", "DATA"},      {"presentationHint", "registers"}, {"variablesReference", 103}, {"expensive", true}},
+        {{"name", "IDATA"},     {"presentationHint", "registers"}, {"variablesReference", 104}, {"expensive", true}},
     };
     SendResponse(seq, "scopes", {{"scopes", scopes}});
 }
@@ -585,20 +769,24 @@ void DapServer::HandleScopes(int seq, const nlohmann::json& args)
 void DapServer::HandleVariables(int seq, const nlohmann::json& args)
 {
     int ref = args.value("variablesReference", 0);
+    LOG("[DAP]  variables ref=%d\n", ref);
 
-    if (ref == 1) {
+    if (ref == 100) {
         // Registers scope — format from the cached RG51.
-        SendResponse(seq, "variables", {{"variables", g_registers.ToVariables()}});
+        auto vars = g_registers.ToVariables();
+        LOG("[DAP]  -> variables ref=100 (Registers): %d items\n", (int)vars.size());
+        nlohmann::json body = {{"variables", vars}};
+        LOG("[DAP]  variables body: %s\n", body.dump().c_str());
+        SendResponse(seq, "variables", body);
         return;
     }
 
-    // Memory scopes (2–5): read a page of memory via AG_MemAcc.
-    // Map scope ref to memory space.
+    // Memory scopes (101–104): read a page of memory via AG_MemAcc.
     struct { int ref; U16 mSpace; const char* name; UL32 size; } memScopes[] = {
-        {2, amCODE,  "CODE",  256},
-        {3, amXDATA, "XDATA", 256},
-        {4, amDATA,  "DATA",  256},
-        {5, amIDATA, "IDATA", 256},
+        {101, amCODE,  "CODE",  256},
+        {102, amXDATA, "XDATA", 256},
+        {103, amDATA,  "DATA",  256},
+        {104, amIDATA, "IDATA", 256},
     };
 
     for (auto& ms : memScopes) {

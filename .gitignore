@@ -43,9 +43,13 @@ compile_commands.json
 # Vendor DLLs — obtain from a licensed Keil µVision installation
 silabs_ref/
 
+# Reference repositories (cloned locally, not part of this project)
+dap_ref/
+
 # Runtime log output
 *.log
 stderr_log.txt
 
 # Local multi-root workspace file (contains machine-specific paths)
 *.code-workspace
+scripts/reset_silabs.ps1
