@@ -53,3 +53,7 @@ stderr_log.txt
 # Local multi-root workspace file (contains machine-specific paths)
 *.code-workspace
 scripts/reset_silabs.ps1
+
+# Dev-only analysis and scratch files
+omf_lines.txt
+scripts/omf_analysis/

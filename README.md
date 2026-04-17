@@ -28,8 +28,10 @@ connects to it automatically when you press F5.
 
 ## Getting the Vendor DLLs
 
-`SiC8051F.dll` and `USBHID.dll` ship with [Keil MDK / µVision](https://www.keil.com/download/product/)
-in `C:\Keil_v5\UV4\Debug_Adapter_DLLs\`. They are **not redistributed** in this repo.
+`SiC8051F.dll` and `USBHID.dll` are included in the
+[Debug Driver for Keil µVision](https://www.silabs.com/software-and-tools/8-bit-8051-microcontroller-software-studio?tab=downloads)
+installer from Silicon Labs. After installation they are typically found in
+`C:\Keil_v5\UV4\Debug_Adapter_DLLs\`. They are **not redistributed** in this repo.
 
 Place them in `silabs_ref/debug_dll/` before building:
 ```
