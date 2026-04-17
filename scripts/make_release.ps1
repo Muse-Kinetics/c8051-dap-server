@@ -64,7 +64,7 @@ if ($proc) {
 
 # --- install_extension.ps1 (points to Release\vscode-extension\) ---
 Set-Content "$out\install_extension.ps1" @'
-$extName   = "local.silabs-8051-debug-0.1.0"
+$extName   = "local.silabs-8051-debug-0.10.0"
 $extSource = "$PSScriptRoot\vscode-extension"
 $extTarget = "$env:USERPROFILE\.vscode\extensions\$extName"
 

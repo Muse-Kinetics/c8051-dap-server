@@ -139,14 +139,10 @@ extern "C" U32 DapAgdiCallback(U32 nCode, void* vp)
             LOG("[DLL]  %s\n", msg.c_str());
             SendOutput(msg + "\n");
 
-            // The DLL does not reliably call AG_RUNSTOP or PostMessage for step/continue
-            // completion.  "Target Halted" in the message stream is the authoritative
-            // signal that the CPU has stopped.  Use it to unblock WaitForHalt().
-            if (msg.find("Halted") != std::string::npos ||
-                msg.find("halted") != std::string::npos) {
-                LOG("[DEBUG] Halt detected via MSGSTRING — signalling halt event\n");
-                g_runControl.SignalHalt("stopped");
-            }
+            // Note: "Target Halted" appears in this callback BEFORE GoStep returns.
+            // Do NOT signal the halt event here — GoStep is still on the stack
+            // on the main thread.  ReadRegisters must run after GoStep returns.
+            // The halt event is signalled from HwndMsgProc after GoStep returns.
         }
         break;
 
@@ -261,9 +257,11 @@ extern "C" U32 DapAgdiCallback(U32 nCode, void* vp)
     }
 
     // AG_RUNSTOP (0x0011) signals that a Go/Step operation has completed.
+    // For direct GoStep calls (AG_NSTEP) this is the primary halt signal.
+    // For GOFORBRK via PostMessage, GoStep blocks on the main thread and
+    // ReadRegisters + SignalHalt happen after it returns — don't double-signal.
     if (nCode == AG_RUNSTOP) {
         LOG("[DEBUG] AG_RUNSTOP — target halted\n");
-        g_runControl.SignalHalt("step");
     }
 
     return AG_OK;
@@ -279,13 +277,11 @@ static DWORD CallGoStepSEH(WORD nCode, DWORD nSteps, GADR* pAddr);
 LRESULT CALLBACK RunControl::HwndMsgProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
     // The DLL calls PostMessage(hWnd, msgToken, ...) after GoStep completes.
-    // We compare msg against m_msgToken — if it matches, signal halt.
+    // For GOFORBRK via WM_USER+3, GoStep blocks on the main thread and the
+    // halt is signalled after GoStep returns (with registers already read).
+    // Just log the PostMessage here; do NOT signal halt early.
     if (msg == g_runControl.GetMsgToken()) {
-        LOGV("RunControl: halt PostMessage received\n");
-        // Primary halt path is DapAgdiCallback(AG_RUNSTOP,...); this is secondary.
-        // Only signal if callback hasn't already done so (WaitForHalt is tolerant
-        // of double-set because the event is auto-reset only after WaitForHalt).
-        g_runControl.SignalHalt("breakpoint");
+        LOGV("RunControl: halt PostMessage received (informational)\n");
         return 0;
     }
 
@@ -319,6 +315,9 @@ LRESULT CALLBACK RunControl::HwndMsgProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp
                 LOG("[DEBUG] HwndMsgProc: GoStep(AG_GOFORBRK) returned\n");
             }
         }
+        // GoStep has returned — the DLL is idle.  Read registers on the main
+        // thread (the only thread that may safely call DLL functions).
+        g_runControl.ReadRegisters();
         g_runControl.SignalHalt("stopped");
         return 0;
     }
@@ -576,6 +575,11 @@ bool RunControl::InitAgdiSession(bool isFlash, bool noErase)
         // The DLL stores this pointer-to-pointer and dereferences it during
         // AG_GoStep(AG_GOFORBRK) to walk the breakpoint list.  It must be
         // the address of a persistent member — NOT a stack local.
+        //
+        // Clear the BP pool first (without calling DLL) to discard any stale
+        // BP nodes from a previous session.  The DLL was reloaded in
+        // UninitAgdiSession, so old BP pointers are invalid.
+        g_bpManager.ClearPool();
         ret = g_agdi.AG_Init(AGDI_INITBPHEAD, g_bpManager.HeadPtr());  // 0x030E
         LOGV("RunControl: INITBPHEAD returned %u\n", ret);
 
@@ -583,6 +587,9 @@ bool RunControl::InitAgdiSession(bool isFlash, bool noErase)
         ret = g_agdi.AG_Init(AGDI_RESET, nullptr);             // 0x040D
         LOGV("RunControl: RESET returned %u\n", ret);
         LOG("[DEBUG] Target reset — waiting for halt...\n");
+        // After AGDI_RESET the target is halted at PC=0x0000.
+        // Signal immediately so the launch handler's WaitForHalt returns.
+        SignalHalt("reset");
     }
 
     m_sessionActive = true;
@@ -663,6 +670,9 @@ bool RunControl::GoStep(WORD nCode, DWORD nSteps, GADR* pAddr)
         LOG("[CRASH] SEH exception 0x%08lX in AG_GoStep(nCode=0x%04X)\n", exc, nCode);
         return false;
     }
+    // For synchronous GoStep calls (AG_NSTEP, AG_GOTILADR), signal halt
+    // immediately so WaitForHalt callers don't time out.
+    SetEvent(m_haltEvent);
     return true;
 }
 
@@ -744,14 +754,15 @@ void RunControl::ReadRegisters()
     if (g_agdi.AG_MemAcc) {
         GADR addr{};
         addr.mSpace = amDATA;
-        UC8 byte = 0;
+        // Use 4-byte buffer — DLL may overwrite past the requested count.
+        UC8 rdBuf[4] = {};
 
         auto ReadSfr = [&](UL32 sfrAddr) -> UC8 {
             addr.Adr = (static_cast<UL32>(amDATA) << 24) | sfrAddr;
-            byte = 0;
-            U32 merr = g_agdi.AG_MemAcc(AG_READ, &byte, &addr, 1);
-            LOG("[REGS] MemAcc(DATA:0x%02X) -> err=%u val=0x%02X\n", sfrAddr, merr, byte);
-            return byte;
+            std::memset(rdBuf, 0, sizeof(rdBuf));
+            U32 merr = g_agdi.AG_MemAcc(AG_READ, rdBuf, &addr, 1);
+            LOG("[REGS] MemAcc(DATA:0x%02X) -> err=%u val=0x%02X\n", sfrAddr, merr, rdBuf[0]);
+            return rdBuf[0];
         };
 
         regs.sp  = ReadSfr(0x81);  // SP

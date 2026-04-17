@@ -66,7 +66,7 @@ directory automatically.
 .\scripts\install_extension.ps1
 ```
 
-Creates a junction from `~/.vscode/extensions/local.silabs-8051-debug-0.1.0` to
+Creates a junction from `~/.vscode/extensions/local.silabs-8051-debug-0.10.0` to
 `vscode-extension\`. Reload VSCode afterwards (`Ctrl+Shift+P` → `Developer: Reload Window`).
 
 ---
@@ -145,15 +145,17 @@ VSCode connects to `127.0.0.1:4711` automatically. The DAP server erases/program
 | `initialize` | Returns capabilities |
 | `launch` | Flash or debug session |
 | `disconnect` / `terminate` | Clean session teardown, DLL reload |
-| `setBreakpoints` | Hardware code breakpoints via AGDI |
+| `setBreakpoints` | Source-line and address breakpoints via AGDI |
 | `threads` | Single thread "C8051F380" |
-| `stackTrace` | Single frame at current PC |
-| `scopes` | Registers, CODE, XDATA, DATA, IDATA scopes |
-| `variables` | Register values or raw memory page dump |
+| `stackTrace` | Single frame with function name and source location |
+| `scopes` | Locals, Registers, CODE, XDATA, DATA, IDATA scopes |
+| `variables` | Local C variables, register values, or raw memory page dump |
+| `evaluate` | Watch/hover: local vars, SFR names, registers, DPTR, hex addresses |
 | `readMemory` | `memoryReference = memSpace<<24 \| address` |
-| `continue` | Run to next breakpoint |
-| `next` | Step over (reads opcode length for correct PC advance) |
+| `continue` | Run to next breakpoint (WDT auto-disabled) |
+| `next` | Step over (LCALL/ACALL detection with temp breakpoints) |
 | `stepIn` | Single instruction step |
+| `stepOut` | Run to return address (read from 8051 stack) |
 | `pause` | Halt running target |
 
 ---
@@ -167,12 +169,12 @@ pip install -r requirements.txt
 
 **Flash test:**
 ```powershell
-.venv\Scripts\python.exe scripts\test_output_events.py
+.venv\Scripts\python.exe scripts\tests\test_output_events.py
 ```
 
 **Debug session test (halt, registers, variables):**
 ```powershell
-.venv\Scripts\python.exe scripts\test_debug_launch.py
+.venv\Scripts\python.exe scripts\tests\test_debug_launch.py
 ```
 
 ---
@@ -186,8 +188,8 @@ Run `.\scripts\install_extension.ps1` and reload VSCode.
 Check EC3 USB is plugged in and the debug header is seated. Restart the server.
 
 **Device doesn't run after `continue`**
-Known issue on some firmware: the debug reset leaves peripherals in a different state
-than a power-on reset. See `Documentation/agent_setup_guide.md` for details.
+The WDT disable sequence is applied automatically. If the device still doesn't run,
+check EC3 connection and restart the server.
 
 **Can't reconnect after VSCode crash**
 The server automatically cleans up if VSCode drops the TCP connection without
@@ -206,32 +208,29 @@ C8051_dap_server/
     agdi.h              AGDI types: GADR, RG51, FLASHPARM, AG_BP, constants
     agdi_loader.h/.cpp  LoadLibrary wrapper, GetProcAddress for AG_* exports
     hex_loader.h/.cpp   Intel HEX parser → flat image + FLASHPARM
-    bp_manager.h/.cpp   AG_BP linked list, alloc/free, enable/disable
+    bp_manager.h/.cpp   AG_BP linked list, alloc/free, enable/disable, temp BPs
     run_control.h/.cpp  Registration chain, halt event, session lifecycle
     registers.h/.cpp    RG51 → DAP variables/scopes response
+    symtab.h/.cpp       m51 parser: symbols, lines, locals, source resolution
     opcodes8051.h       256-entry 8051 instruction length table
-    log.h               LOG() → stdout; LOGV() → stderr
+    log.h               LOG() → stdout+stderr; LOGV() → stderr only
     SiC8051F.wsp        Adapter config file read by SiC8051F.dll
   vscode-extension/
     package.json        VSCode extension manifest (silabs8051 debug type)
     extension.js        Registers DebugAdapterDescriptorFactory → port 4711
   scripts/
-    start_server.ps1    Launch dap_server.exe in a new console window
-    stop_server.ps1     Kill dap_server.exe
+    start_server.ps1       Launch dap_server.exe in a new console window
+    stop_server.ps1        Kill dap_server.exe
+    ensure_server.ps1      Idempotent start (safe as preLaunchTask)
     install_extension.ps1  Install the VSCode extension via junction
-    make_release.ps1    Assemble a self-contained Release\ folder
-    test_output_events.py  Flash + output events test
-    test_debug_launch.py   Full debug session test
-    test_flash.py          Flash test (explicit HEX arg)
-    test_erase.py          Erase-only test
-    test_dap.py            Low-level DAP probe
+    make_release.ps1       Assemble a self-contained Release\ folder
+    tests/                 Python DAP integration tests
+    omf_analysis/          OMF-51 dump/analysis utilities (dev)
   Documentation/
-    agent_setup_guide.md        Developer/agent handoff guide
-    DAP_server_plan.md          Original design plan and phase log
-    project_goals_and_findings.md  DLL reverse-engineering notes
-    S8051_DLL_findings.md
-    SiC8051F_DLL_proxy.md
-    SiC8051F_static_analysis.md
+    agent_setup_guide.md          Developer/agent handoff guide
+    DAP_implementation_status.md  Feature matrix and open bugs
+    dll/                          SiC8051F.dll reverse-engineering notes
+    xx_archive/                   Historical design docs and phase logs
   silabs_ref/           Vendor DLLs (gitignored — not redistributed)
   CMakeLists.txt
   requirements.txt
@@ -255,7 +254,7 @@ Key reverse-engineering findings are documented in the `Documentation/` folder.
 
 - **Windows only** — `SiC8051F.dll` is a 32-bit Windows DLL.
 - **Single session** — one DAP client at a time.
-- **No source mapping** — Keil C51 doesn't produce DWARF; the stack frame shows raw PC only.
+- **No type info** — Keil C51 `int` (16-bit) and `long` (32-bit) are displayed as 8-bit values in the Locals/Watch panel because the m51 map does not include type information.
 - **Flash dialog** — a DLL-internal progress dialog may briefly appear during flash operations.
 
 ---

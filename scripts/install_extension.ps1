@@ -7,7 +7,7 @@
 #
 # Run once; restart VSCode afterwards.
 
-$extName   = "local.silabs-8051-debug-0.1.0"
+$extName   = "local.silabs-8051-debug-0.10.0"
 $extSource = "$PSScriptRoot\..\vscode-extension"
 $extTarget = "$env:USERPROFILE\.vscode\extensions\$extName"
 

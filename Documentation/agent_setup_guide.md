@@ -30,25 +30,26 @@ Microsoft DAP server over TCP port 4711, allowing VSCode to debug or flash the t
 | Debug launch — reset, halt at PC=0x0000 | ✅ HW verified |
 | `stopped` event on halt | ✅ HW verified |
 | `threads`, `stackTrace`, `scopes`, `variables` | ✅ HW verified |
-| `continue`, `next` (step-over), `stepIn`, `pause` | ✅ Implemented, tested in DAP |
-| `setBreakpoints` | ✅ Implemented, basic HW test |
+| `continue` (with WDT disable) | ✅ HW verified |
+| `next` (step-over with CALL detection) | ✅ HW verified |
+| `stepIn` (single instruction) | ✅ HW verified |
+| `stepOut` (return addr from stack) | ✅ HW verified |
+| `setBreakpoints` (source line + address) | ✅ HW verified |
+| `evaluate` (watch/hover: locals, SFRs, regs) | ✅ HW verified |
 | `readMemory` | ✅ Implemented |
+| Source mapping (m51 LINE# → file:line) | ✅ Working |
+| Local variables (Locals panel from m51 PROC) | ✅ Implemented (values under investigation) |
 | VSCode extension (silabs8051 debug type) | ✅ Working — F5 launches session |
 | Crash recovery (VSCode killed without disconnect) | ✅ Fixed — server auto-cleans |
 
 ## Known Issues / Active Investigation
 
-- **Device not running after `continue`** — when VSCode sends `continue` in debug mode,
-  the target appears to not actually execute. The SoftStep firmware likely crashes
-  immediately after reset-vector halt because the debug reset leaves hardware in a
-  different state than a power-on reset (USB PLL not initialized, watchdog, etc.).
-  `WaitForHalt` then times out after 30s and VSCode goes dark.
-  **Next step:** verify `AG_GOFORBRK` is being called correctly; check whether firmware
-  needs to run past init before a breakpoint-based halt works.
-
-- **No source mapping** — the 8051 toolchain (Keil C51) doesn't produce DWARF; the stack
-  frame shows PC=0x0000 only. VSCode shows "0" in the call stack. This is expected and
-  cosmetic. Breakpoints must be set by raw address in the `address` field.
+- **Locals showing 0x00** — The Locals panel displays variables but values may show as
+  0x00. Under investigation — possible m51 address mapping issue.
+- **Watch shows 8-bit for 16-bit `int`** — m51 has no type info; all reads are 1 byte.
+  Keil C51 `int` is 16-bit.
+- **Pause button** — DAP pause request never arrives from VSCode. See BUG-1 in
+  `DAP_implementation_status.md`.
 
 ---
 
@@ -63,17 +64,16 @@ Silabs-8051-GDB/
     agdi.h                AGDI types: GADR, RG51, FLASHPARM, AG_BP, all constants
     agdi_loader.h/.cpp    LoadLibrary wrapper, GetProcAddress for all AG_* exports
     hex_loader.h/.cpp     Intel HEX parser -> flat byte image + FLASHPARM
-    bp_manager.h/.cpp     AG_BP linked list, alloc/free, enable/disable
+    bp_manager.h/.cpp     AG_BP linked list, alloc/free, enable/disable, temp BPs
     run_control.h/.cpp    Registration chain, GoStep, halt event, UNINIT+DLL reload
     registers.h/.cpp      RG51 -> DAP variables/scopes responses
+    symtab.h/.cpp         m51 parser: symbols, lines, locals, source resolution
     opcodes8051.h         256-entry 8051 instruction length table (for step-over)
-    log.h                 LOG() -> stdout; LOGV() -> stderr only
+    log.h                 LOG() -> stdout+stderr; LOGV() -> stderr only
   vscode-extension/
     package.json          VSCode extension manifest (silabs8051 debug type)
     extension.js          Registers DebugAdapterDescriptorFactory -> port 4711
   build/                  CMake output (MSVC x86 Debug)
-  SoftStep/               Junction -> ../../softstep-firmware/Softstep2
-  silabs-softstep.code-workspace   Multi-root workspace (both repos + build tasks)
   scripts/
     start_server.ps1      Launch dap_server.exe in a new window
     stop_server.ps1       Kill dap_server.exe
@@ -85,12 +85,14 @@ Silabs-8051-GDB/
     test_flash.py         Flash test (explicit HEX path arg)
     test_erase.py         Erase-only test (flashes all-0xFF image)
   Documentation/
-    DAP_server_plan.md          Original design plan
+    DAP_implementation_status.md Feature matrix and open bugs
+    DAP_server_plan.md          Original design plan and phase log
+    phase9_source_debug.md      Source-level debug implementation notes
     project_goals_and_findings.md  DLL reverse-engineering findings
+    agent_setup_guide.md        <- this file
     S8051_DLL_findings.md
     SiC8051F_DLL_proxy.md
     SiC8051F_static_analysis.md
-    agent_setup_guide.md        <- this file
 ```
 
 ---
@@ -288,10 +290,8 @@ Done
 - Stop and restart the server.
 
 ### Device appears not to run after `continue`
-Known issue under investigation. The SoftStep firmware may crash immediately after
-halt-at-reset-vector because the debug reset leaves peripherals in an uninitialized state.
-`WaitForHalt` will time out after 30s and VSCode will go dark. Restart the server and
-reconnect. The 30s timeout is in `WaitAndSendStopped()` in `dap_server.cpp`.
+The WDT disable sequence is now applied automatically before every `continue`. If the
+device still doesn't run, check the EC3 connection and restart the server.
 
 ### VSCode session crashes / can't reconnect
 The server now calls `UninitAgdiSession()` automatically when the TCP connection drops
@@ -335,7 +335,4 @@ These must be present alongside `dap_server.exe` for it to function:
 - `USBHID.dll` — USB HID transport dependency loaded by `SiC8051F.dll`
 
 CMake copies these automatically during build.
-
-
-- **No source mapping** — the 8051 has no DWARF debug info; the stack trace shows PC only.
   Breakpoints accept a raw address in the `address` field.

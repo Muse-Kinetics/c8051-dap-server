@@ -8,12 +8,20 @@
 
 #include "registers.h"
 #include "symtab.h"
+#include "log.h"
 
 #include <cstring>
 #include <iomanip>
 #include <sstream>
 
 RegisterCache g_registers;
+
+// Return basename of a path (filename portion only).
+static std::string BaseName(const std::string& path)
+{
+    size_t slash = path.find_last_of("/\\");
+    return (slash == std::string::npos) ? path : path.substr(slash + 1);
+}
 
 // ---------------------------------------------------------------------------
 // RegisterCache
@@ -30,6 +38,12 @@ uint32_t RegisterCache::PC() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_valid ? m_regs.nPC : 0u;
+}
+
+uint8_t RegisterCache::SP() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_valid ? m_regs.sp : 0u;
 }
 
 // Helper: format a byte as a two-digit hex string
@@ -93,14 +107,17 @@ nlohmann::json RegisterCache::ToStackFrame(int frameId) const
     // Try line-level source info first, then fall back to symbol name.
     auto loc = g_symtab.LookupLine(pc);
     if (loc) {
+        std::string sym = g_symtab.LookupSymbol(pc);
+        std::string frameName = sym.empty() ? HexDword(pc) : sym;
+        LOGV("[FRAME] PC=0x%04X -> %s @ %s:%d\n", pc, frameName.c_str(),
+             loc->file.c_str(), loc->line);
         nlohmann::json frame = {
             {"id",     frameId},
-            {"name",   g_symtab.LookupSymbol(pc).empty()
-                           ? HexDword(pc)
-                           : g_symtab.LookupSymbol(pc)},
-            {"source", {{"path", loc->file}, {"presentationHint", "normal"}}},
+            {"name",   frameName},
+            {"source", {{"name", BaseName(loc->file)}, {"path", loc->file}, {"presentationHint", "normal"}}},
             {"line",   loc->line},
             {"column", 1},
+            {"instructionReference", HexDword(pc)},
         };
         return frame;
     }
@@ -108,22 +125,22 @@ nlohmann::json RegisterCache::ToStackFrame(int frameId) const
     // Line-level not available — try function-name-only from symbol table.
     std::string sym = g_symtab.LookupSymbol(pc);
     if (!sym.empty()) {
+        LOGV("[FRAME] PC=0x%04X -> %s (no line info)\n", pc, sym.c_str());
         return {
             {"id",     frameId},
             {"name",   sym},
-            {"source", {{"name", "8051.asm"}, {"sourceReference", 0}, {"presentationHint", "deemphasize"}}},
-            {"line",   1},
+            {"line",   0},
             {"column", 1},
             {"instructionReference", HexDword(pc)},
         };
     }
 
     // Fallback: bare hex address, no source.
+    LOGV("[FRAME] PC=0x%04X -> no symbol, no line\n", pc);
     return {
         {"id",     frameId},
         {"name",   HexDword(pc)},
-        {"source", {{"name", "8051.asm"}, {"sourceReference", 0}, {"presentationHint", "deemphasize"}}},
-        {"line",   1},
+        {"line",   0},
         {"column", 1},
         {"instructionReference", HexDword(pc)},
     };

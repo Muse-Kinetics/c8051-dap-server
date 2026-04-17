@@ -75,11 +75,14 @@ private:
     void HandleContinue        (int seq, const nlohmann::json& args);
     void HandleNext            (int seq, const nlohmann::json& args);
     void HandleStepIn          (int seq, const nlohmann::json& args);
+    void HandleStepOut         (int seq, const nlohmann::json& args);
     void HandlePause           (int seq, const nlohmann::json& args);
     void HandleStackTrace      (int seq, const nlohmann::json& args);
     void HandleScopes          (int seq, const nlohmann::json& args);
     void HandleVariables       (int seq, const nlohmann::json& args);
     void HandleReadMemory      (int seq, const nlohmann::json& args);
+    void HandleEvaluate        (int seq, const nlohmann::json& args);
+    void HandleSource          (int seq, const nlohmann::json& args);
 
     int  m_port;
     SOCKET m_listenSock  = INVALID_SOCKET;

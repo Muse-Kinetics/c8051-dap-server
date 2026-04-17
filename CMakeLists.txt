@@ -9,7 +9,7 @@
 
 cmake_minimum_required(VERSION 3.20)
 
-project(C8051_dap_server VERSION 0.9.0 LANGUAGES CXX)
+project(C8051_dap_server VERSION 0.10.0 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "This project targets Windows only (SiC8051F.dll is a 32-bit Windows DLL).")

@@ -24,6 +24,8 @@
 #include "log.h"
 
 #include <cstdio>
+#include <cctype>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -362,11 +364,14 @@ void DapServer::Dispatch(const nlohmann::json& msg)
     else if (command == "continue")          HandleContinue         (seq, args);
     else if (command == "next")              HandleNext             (seq, args);
     else if (command == "stepIn")            HandleStepIn           (seq, args);
+    else if (command == "stepOut")           HandleStepOut          (seq, args);
     else if (command == "pause")             HandlePause            (seq, args);
     else if (command == "stackTrace")        HandleStackTrace       (seq, args);
     else if (command == "scopes")            HandleScopes           (seq, args);
     else if (command == "variables")         HandleVariables        (seq, args);
     else if (command == "readMemory")        HandleReadMemory       (seq, args);
+    else if (command == "evaluate")          HandleEvaluate         (seq, args);
+    else if (command == "source")            HandleSource           (seq, args);
     else {
         LOG("[DAP]  <- %s: not implemented\n", command.c_str());
         SendResponse(seq, command, nlohmann::json(nullptr),
@@ -565,10 +570,17 @@ void DapServer::HandleSetBreakpoints(int seq, const nlohmann::json& args)
     }
 
     int count = 0;
-    if (!addresses.empty() && g_runControl.IsSessionActive()) {
-        count = g_bpManager.SetBreakpoints(addresses.data(),
-                                           static_cast<int>(addresses.size()),
-                                           amCODE);
+    if (g_runControl.IsSessionActive()) {
+        if (!addresses.empty()) {
+            count = g_bpManager.SetFileBreakpoints(sourcePath,
+                                                   addresses.data(),
+                                                   static_cast<int>(addresses.size()),
+                                                   amCODE);
+        } else {
+            // Empty breakpoints array — clear all BPs for this file.
+            g_bpManager.SetFileBreakpoints(sourcePath, nullptr, 0, amCODE);
+            LOG("[BP]   Cleared all breakpoints for %s\n", sourcePath.c_str());
+        }
     }
 
     // Build the verified breakpoints response.
@@ -616,7 +628,9 @@ static void WaitAndSendStopped(const std::string& reason, uint32_t gen)
         return;
     }
 
-    g_runControl.ReadRegisters();
+    // Registers were already read on the main thread (in HwndMsgProc)
+    // immediately after GoStep returned.  Do NOT call ReadRegisters here —
+    // DLL functions are not thread-safe.
     uint32_t pc = g_registers.PC();
     LOG("[DEBUG] Halted at PC=0x%04X  reason=%s\n", pc, reason.c_str());
 
@@ -675,26 +689,106 @@ void DapServer::HandleNext(int seq, const nlohmann::json& /*args*/)
 {
     SendResponse(seq, "next");
 
-    // Step-over: compute the address of the next sequential instruction.
-    // Read the opcode byte at PC to determine instruction length.
-    uint32_t pc = g_registers.PC();
-    UC8 opcByte = 0;
-    GADR addr{};
-    addr.Adr    = (static_cast<UL32>(amCODE) << 24) | (pc & 0xFFFF);
-    addr.nLen   = 1;
-    addr.mSpace = amCODE;
-    if (g_agdi.AG_MemAcc) {
-        g_agdi.AG_MemAcc(AG_READ, &opcByte, &addr, 1);
-    }
-    uint32_t nextPC = pc + k8051InstructionLength[opcByte];
+    // Source-level step over:
+    // Step instructions in a loop until the source line changes.
+    // When the current instruction is a CALL (LCALL/ACALL), set a temporary
+    // breakpoint at the return address and run instead of single-stepping
+    // through the entire called function.
+    // When we detect SP > startSP (inside a called function, e.g. due to
+    // hitting a user breakpoint inside the call), use a temp BP at the
+    // stack return address to quickly step out.
+    uint32_t startPC = g_registers.PC();
+    auto startLoc = g_symtab.LookupLine(startPC);
 
-    GADR target{};
-    target.Adr    = nextPC & 0xFFFF;
-    target.mSpace = amCODE;
+    if (startLoc && g_symtab.IsLoaded()) {
+        uint8_t startSP = g_registers.SP();
 
-    if (g_runControl.GoStep(AG_GOTILADR, 0, &target)) {
-        uint32_t gen = ++g_runGeneration;
-        std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
+        for (int i = 0; i < 50000; ++i) {
+            uint32_t pc = g_registers.PC();
+            uint8_t  sp = g_registers.SP();
+
+            // If we're inside a called function (SP grew), step out quickly
+            // by setting a temp BP at the return address on the stack.
+            if (sp > startSP) {
+                // 8051 LCALL stack layout: [SP]=PCH, [SP-1]=PCL
+                // Use 4-byte buffers — DLL may overwrite past requested count.
+                UC8 pclBuf[4] = {}, pchBuf[4] = {};
+                GADR stkAddr{};
+                stkAddr.mSpace = amDATA;
+                stkAddr.Adr = (static_cast<UL32>(amDATA) << 24) | sp;
+                g_agdi.AG_MemAcc(AG_READ, pchBuf, &stkAddr, 1);
+                stkAddr.Adr = (static_cast<UL32>(amDATA) << 24) | (sp - 1);
+                g_agdi.AG_MemAcc(AG_READ, pclBuf, &stkAddr, 1);
+                uint32_t retAddr = (static_cast<uint32_t>(pchBuf[0]) << 8) | pclBuf[0];
+
+                AG_BP* tempBP = g_bpManager.AddTempBreakpoint(retAddr, amCODE);
+                g_runControl.ResetHaltEvent();
+                g_runControl.RequestRun();
+                g_runControl.WaitForHalt(30000);
+                g_bpManager.RemoveTempBreakpoint(tempBP);
+                // Registers already read by WM_USER+3 handler.
+                continue;
+            }
+
+            // Read the opcode at the current PC from CODE space.
+            // Use 4-byte buffer — DLL may overwrite past requested count.
+            UC8 opBuf[4] = {};
+            if (g_agdi.AG_MemAcc) {
+                GADR codeAddr{};
+                codeAddr.mSpace = amCODE;
+                codeAddr.Adr = (static_cast<UL32>(amCODE) << 24) | (pc & 0xFFFF);
+                g_agdi.AG_MemAcc(AG_READ, opBuf, &codeAddr, 1);
+            }
+            UC8 opcode = opBuf[0];
+
+            // Detect CALL instructions:
+            //   LCALL addr16 = 0x12 (3 bytes)
+            //   ACALL addr11 = xxx1_0001 pattern (2 bytes)
+            bool isCall = (opcode == 0x12) || ((opcode & 0x1F) == 0x11);
+
+            if (isCall) {
+                // Step over the CALL: set temp BP at the instruction after it.
+                uint32_t nextPC = pc + ((opcode == 0x12) ? 3 : 2);
+                AG_BP* tempBP = g_bpManager.AddTempBreakpoint(nextPC, amCODE);
+                g_runControl.ResetHaltEvent();
+                g_runControl.RequestRun();
+                g_runControl.WaitForHalt(30000);
+                g_bpManager.RemoveTempBreakpoint(tempBP);
+                // Registers already read by WM_USER+3 handler.
+            } else {
+                // Normal single instruction step.
+                g_runControl.GoStep(AG_NSTEP, 1, nullptr);
+                g_runControl.WaitForHalt(5000);
+                g_runControl.ReadRegisters();
+            }
+
+            pc = g_registers.PC();
+
+            auto loc = g_symtab.LookupLine(pc);
+            if (!loc)
+                continue;
+            // Same line — keep stepping.
+            if (loc->file == startLoc->file && loc->line == startLoc->line)
+                continue;
+            // Different source line — done.
+            break;
+        }
+
+        // Already halted and registers read — send stopped event directly.
+        uint32_t pc = g_registers.PC();
+        LOG("[DEBUG] Source step-over complete at PC=0x%04X\n", pc);
+        SendEvent("stopped", {
+            {"reason",            kStopReasonStep},
+            {"threadId",          kThreadId},
+            {"allThreadsStopped", true},
+        });
+    } else {
+        // No source info — fall back to single instruction step.
+        if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
+            g_runControl.ReadRegisters();  // safe: GoStep already returned
+            uint32_t gen = ++g_runGeneration;
+            std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
+        }
     }
 }
 
@@ -702,10 +796,87 @@ void DapServer::HandleStepIn(int seq, const nlohmann::json& /*args*/)
 {
     SendResponse(seq, "stepIn");
 
-    // Single-step: execute one instruction.
-    if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
-        uint32_t gen = ++g_runGeneration;
-        std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
+    // Source-level step in: step instructions until the source line changes.
+    // Unlike step-over, we do NOT check SP — we follow into calls.
+    uint32_t startPC = g_registers.PC();
+    auto startLoc = g_symtab.LookupLine(startPC);
+
+    if (startLoc && g_symtab.IsLoaded()) {
+        for (int i = 0; i < 50000; ++i) {
+            g_runControl.GoStep(AG_NSTEP, 1, nullptr);
+            g_runControl.WaitForHalt(5000);
+            g_runControl.ReadRegisters();
+
+            uint32_t pc = g_registers.PC();
+            auto loc = g_symtab.LookupLine(pc);
+            if (!loc)
+                continue;
+            if (loc->file == startLoc->file && loc->line == startLoc->line)
+                continue;
+            break;
+        }
+
+        uint32_t pc = g_registers.PC();
+        LOG("[DEBUG] Source step-in complete at PC=0x%04X\n", pc);
+        SendEvent("stopped", {
+            {"reason",            kStopReasonStep},
+            {"threadId",          kThreadId},
+            {"allThreadsStopped", true},
+        });
+    } else {
+        // No source info — single instruction step.
+        if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
+            g_runControl.ReadRegisters();  // safe: GoStep already returned
+            uint32_t gen = ++g_runGeneration;
+            std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
+        }
+    }
+}
+
+void DapServer::HandleStepOut(int seq, const nlohmann::json& /*args*/)
+{
+    SendResponse(seq, "stepOut");
+
+    // Step out: read the return address from the 8051 stack and run until we
+    // reach it.  On 8051, LCALL/ACALL push PCL first then PCH:
+    //   SP+1 → store PCL, SP+1 → store PCH
+    // After LCALL: [SP] = PCH (high byte), [SP-1] = PCL (low byte)
+    uint8_t sp = g_registers.SP();
+
+    if (sp >= 2 && g_agdi.AG_MemAcc) {
+        // Use 4-byte buffers — DLL may overwrite past requested count.
+        UC8 pclBuf[4] = {}, pchBuf[4] = {};
+        GADR addr{};
+        addr.mSpace = amDATA;
+
+        // Read PCH at [SP] (pushed last = top of stack)
+        addr.Adr = (static_cast<UL32>(amDATA) << 24) | sp;
+        g_agdi.AG_MemAcc(AG_READ, pchBuf, &addr, 1);
+
+        // Read PCL at [SP-1] (pushed first)
+        addr.Adr = (static_cast<UL32>(amDATA) << 24) | (sp - 1);
+        g_agdi.AG_MemAcc(AG_READ, pclBuf, &addr, 1);
+
+        uint32_t retAddr = (static_cast<uint32_t>(pchBuf[0]) << 8) | pclBuf[0];
+        LOG("[DEBUG] Step out: SP=0x%02X, return address=0x%04X\n", sp, retAddr);
+
+        GADR target{};
+        target.Adr    = retAddr & 0xFFFF;
+        target.mSpace = amCODE;
+
+        if (g_runControl.GoStep(AG_GOTILADR, 0, &target)) {
+            g_runControl.ReadRegisters();  // safe: GoStep already returned
+            uint32_t gen = ++g_runGeneration;
+            std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
+        }
+    } else {
+        LOG("[DEBUG] Step out: SP too low (%d) or no AG_MemAcc\n", sp);
+        // Fall back to single step.
+        if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
+            g_runControl.ReadRegisters();  // safe: GoStep already returned
+            uint32_t gen = ++g_runGeneration;
+            std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
+        }
     }
 }
 
@@ -751,18 +922,29 @@ void DapServer::HandleStackTrace(int seq, const nlohmann::json& /*args*/)
 void DapServer::HandleScopes(int seq, const nlohmann::json& args)
 {
     // Scope variablesReference IDs (use 100+ to avoid collision with frame IDs):
+    //   99  = Locals (C variables in the current function)
     //   100 = Registers
     //   101 = CODE memory
     //   102 = XDATA memory
     //   103 = DATA memory
     //   104 = IDATA memory
-    nlohmann::json scopes = {
-        {{"name", "Registers"}, {"presentationHint", "locals"},    {"variablesReference", 100}, {"expensive", false}},
-        {{"name", "CODE"},      {"presentationHint", "registers"}, {"variablesReference", 101}, {"expensive", true}},
-        {{"name", "XDATA"},     {"presentationHint", "registers"}, {"variablesReference", 102}, {"expensive", true}},
-        {{"name", "DATA"},      {"presentationHint", "registers"}, {"variablesReference", 103}, {"expensive", true}},
-        {{"name", "IDATA"},     {"presentationHint", "registers"}, {"variablesReference", 104}, {"expensive", true}},
-    };
+    nlohmann::json scopes = nlohmann::json::array();
+
+    // Only show Locals scope if we have local variable info for the current PC.
+    if (g_symtab.IsLoaded()) {
+        auto locals = g_symtab.LookupLocals(g_registers.PC());
+        if (!locals.empty()) {
+            scopes.push_back({{"name", "Locals"}, {"presentationHint", "locals"},
+                              {"variablesReference", 99}, {"expensive", false}});
+        }
+    }
+
+    scopes.push_back({{"name", "Registers"}, {"presentationHint", "registers"}, {"variablesReference", 100}, {"expensive", false}});
+    scopes.push_back({{"name", "CODE"},      {"presentationHint", "registers"}, {"variablesReference", 101}, {"expensive", true}});
+    scopes.push_back({{"name", "XDATA"},     {"presentationHint", "registers"}, {"variablesReference", 102}, {"expensive", true}});
+    scopes.push_back({{"name", "DATA"},      {"presentationHint", "registers"}, {"variablesReference", 103}, {"expensive", true}});
+    scopes.push_back({{"name", "IDATA"},     {"presentationHint", "registers"}, {"variablesReference", 104}, {"expensive", true}});
+
     SendResponse(seq, "scopes", {{"scopes", scopes}});
 }
 
@@ -770,6 +952,28 @@ void DapServer::HandleVariables(int seq, const nlohmann::json& args)
 {
     int ref = args.value("variablesReference", 0);
     LOG("[DAP]  variables ref=%d\n", ref);
+
+    // Locals scope — read C variables for the current function.
+    if (ref == 99 && g_symtab.IsLoaded() && g_agdi.AG_MemAcc) {
+        auto locals = g_symtab.LookupLocals(g_registers.PC());
+        nlohmann::json vars = nlohmann::json::array();
+        for (const auto& lv : locals) {
+            UC8 rdBuf[4] = {};
+            GADR addr{};
+            addr.mSpace = lv.mSpace;
+            addr.Adr    = (static_cast<UL32>(lv.mSpace) << 24) | (lv.addr & 0xFFFF);
+            g_agdi.AG_MemAcc(AG_READ, rdBuf, &addr, 1);
+            char valStr[8];
+            _snprintf_s(valStr, sizeof(valStr), "0x%02X", rdBuf[0]);
+            vars.push_back({
+                {"name",               lv.name},
+                {"value",              valStr},
+                {"variablesReference", 0},
+            });
+        }
+        SendResponse(seq, "variables", {{"variables", vars}});
+        return;
+    }
 
     if (ref == 100) {
         // Registers scope — format from the cached RG51.
@@ -870,4 +1074,188 @@ void DapServer::HandleReadMemory(int seq, const nlohmann::json& args)
         {"unreadableBytes",  (ret != AG_OK) ? count : 0},
         {"data",             encoded},
     });
+}
+
+void DapServer::HandleEvaluate(int seq, const nlohmann::json& args)
+{
+    // DAP evaluate: watch expressions, debug console, hover.
+    // Supports: 8051 register names, PUBLIC symbol names, hex addresses (0xNNNN).
+    std::string expr = args.value("expression", "");
+    if (expr.empty()) {
+        SendResponse(seq, "evaluate", nlohmann::json(nullptr), false, "empty expression");
+        return;
+    }
+
+    // Normalize to uppercase for register matching.
+    std::string upper;
+    for (char c : expr) upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+
+    // Try 8051 register names.
+    // Read from the register cache (already populated after halt).
+    g_runControl.ReadRegisters();
+
+    struct RegInfo { const char* name; };
+    // SFR registers readable via AG_MemAcc from DATA space.
+    struct SfrInfo { const char* name; uint16_t addr; };
+    static const SfrInfo sfrs[] = {
+        {"ACC",  0xE0}, {"A",    0xE0}, {"B",    0xF0}, {"SP",   0x81},
+        {"PSW",  0xD0}, {"DPL",  0x82}, {"DPH",  0x83}, {"IE",   0xA8},
+        {"IP",   0xB8}, {"TCON", 0x88}, {"TMOD", 0x89}, {"P0",   0x80},
+        {"P1",   0x90}, {"P2",   0xA0}, {"P3",   0xB0}, {"SCON0",0x98},
+        {"SBUF0",0x99}, {"WDTCN",0x97}, {"PCON", 0x87},
+    };
+
+    // Check PC first.
+    if (upper == "PC") {
+        uint32_t pc = g_registers.PC();
+        char buf[12];
+        _snprintf_s(buf, sizeof(buf), "0x%04X", pc);
+        SendResponse(seq, "evaluate", {
+            {"result", std::string(buf)},
+            {"variablesReference", 0},
+        });
+        return;
+    }
+
+    // Check R0-R7.
+    if (upper.size() == 2 && upper[0] == 'R' && upper[1] >= '0' && upper[1] <= '7') {
+        int idx = upper[1] - '0';
+        // Read Rn via AG_RegAcc.
+        GVAL val{};
+        if (g_agdi.AG_RegAcc) {
+            g_agdi.AG_RegAcc(AG_READ, idx, &val);
+        }
+        char buf[8];
+        _snprintf_s(buf, sizeof(buf), "0x%02X", val.uc);
+        SendResponse(seq, "evaluate", {
+            {"result", std::string(buf)},
+            {"variablesReference", 0},
+        });
+        return;
+    }
+
+    // Check DPTR (16-bit combo of DPH:DPL).
+    if (upper == "DPTR") {
+        if (g_agdi.AG_MemAcc) {
+            UC8 dplBuf[4] = {}, dphBuf[4] = {};
+            GADR a{};
+            a.mSpace = amDATA;
+            a.Adr = (static_cast<UL32>(amDATA) << 24) | 0x82;
+            g_agdi.AG_MemAcc(AG_READ, dplBuf, &a, 1);
+            a.Adr = (static_cast<UL32>(amDATA) << 24) | 0x83;
+            g_agdi.AG_MemAcc(AG_READ, dphBuf, &a, 1);
+            uint16_t dptr = (static_cast<uint16_t>(dphBuf[0]) << 8) | dplBuf[0];
+            char buf[8];
+            _snprintf_s(buf, sizeof(buf), "0x%04X", dptr);
+            SendResponse(seq, "evaluate", {
+                {"result", std::string(buf)},
+                {"variablesReference", 0},
+                {"memoryReference", std::string(buf)},
+            });
+            return;
+        }
+    }
+
+    // Check SFR names.
+    for (const auto& sfr : sfrs) {
+        if (upper != sfr.name) continue;
+        if (g_agdi.AG_MemAcc) {
+            UC8 rdBuf[4] = {};
+            GADR a{};
+            a.mSpace = amDATA;
+            a.Adr = (static_cast<UL32>(amDATA) << 24) | sfr.addr;
+            g_agdi.AG_MemAcc(AG_READ, rdBuf, &a, 1);
+            char buf[8];
+            _snprintf_s(buf, sizeof(buf), "0x%02X", rdBuf[0]);
+            SendResponse(seq, "evaluate", {
+                {"result", std::string(buf)},
+                {"variablesReference", 0},
+            });
+            return;
+        }
+    }
+
+    // Try local variable lookup (C variables in the current function).
+    if (g_symtab.IsLoaded() && g_agdi.AG_MemAcc) {
+        auto lv = g_symtab.LookupLocalByName(expr, g_registers.PC());
+        if (lv) {
+            UC8 rdBuf[4] = {};
+            GADR a{};
+            a.mSpace = lv->mSpace;
+            a.Adr    = (static_cast<UL32>(lv->mSpace) << 24) | (lv->addr & 0xFFFF);
+            g_agdi.AG_MemAcc(AG_READ, rdBuf, &a, 1);
+            char buf[8];
+            _snprintf_s(buf, sizeof(buf), "0x%02X", rdBuf[0]);
+            SendResponse(seq, "evaluate", {
+                {"result", std::string(buf)},
+                {"variablesReference", 0},
+            });
+            return;
+        }
+    }
+
+    // Try symbol lookup (PUBLIC symbols from m51).
+    if (g_symtab.IsLoaded()) {
+        // Search for a symbol matching the expression by name.
+        auto addr = g_symtab.LookupSymbolByName(upper);
+        if (addr) {
+            char buf[12];
+            _snprintf_s(buf, sizeof(buf), "0x%04X", *addr);
+            SendResponse(seq, "evaluate", {
+                {"result",            std::string(buf)},
+                {"variablesReference", 0},
+                {"memoryReference",   std::string(buf)},
+            });
+            return;
+        }
+    }
+
+    // Try hex address: 0xNNNN — read one byte from CODE space.
+    if (expr.size() > 2 && expr[0] == '0' && (expr[1] == 'x' || expr[1] == 'X')) {
+        try {
+            uint32_t addr = static_cast<uint32_t>(std::stoul(expr, nullptr, 16));
+            if (g_agdi.AG_MemAcc) {
+                UC8 rdBuf[4] = {};
+                GADR a{};
+                a.mSpace = amCODE;
+                a.Adr = (static_cast<UL32>(amCODE) << 24) | (addr & 0xFFFF);
+                g_agdi.AG_MemAcc(AG_READ, rdBuf, &a, 1);
+                char buf[8];
+                _snprintf_s(buf, sizeof(buf), "0x%02X", rdBuf[0]);
+                SendResponse(seq, "evaluate", {
+                    {"result", std::string(buf)},
+                    {"variablesReference", 0},
+                    {"memoryReference", expr},
+                });
+                return;
+            }
+        } catch (...) {}
+    }
+
+    SendResponse(seq, "evaluate", nlohmann::json(nullptr), false,
+                 "Cannot evaluate: " + expr);
+}
+
+void DapServer::HandleSource(int seq, const nlohmann::json& args)
+{
+    // DAP source request: client wants the content of a source file.
+    // If the source has a path, read it from disk.
+    if (args.contains("source") && args["source"].is_object()) {
+        std::string path = args["source"].value("path", "");
+        if (!path.empty()) {
+            std::ifstream f(path);
+            if (f.is_open()) {
+                std::ostringstream ss;
+                ss << f.rdbuf();
+                SendResponse(seq, "source", {
+                    {"content",  ss.str()},
+                    {"mimeType", "text/plain"},
+                });
+                return;
+            }
+        }
+    }
+
+    // No path or file not found.
+    SendResponse(seq, "source", {{"content", "// source not available"}});
 }

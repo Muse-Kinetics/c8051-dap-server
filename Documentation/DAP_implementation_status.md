@@ -1,7 +1,7 @@
 # DAP Implementation Status
 
-**Last updated:** April 15, 2026  
-**Server version:** v0.9.0  
+**Last updated:** April 16, 2026  
+**Server version:** v0.10.0  
 **Reference:** Microsoft vscode-mock-debug (`dap_ref/vscode-mock-debug/`)
 
 ---
@@ -21,35 +21,35 @@ and the mock-debug reference implementation.
 | `disconnect` | `HandleDisconnect` | No | Uninits AGDI session, clears symtab/hex |
 | `terminate` | → `HandleDisconnect` | No | Aliased to disconnect |
 | `setBreakpoints` | `HandleSetBreakpoints` | No | Supports `address` field, `line`+symtab lookup, raw line fallback |
+| `setExceptionBreakpoints` | `HandleSetExceptionBreakpoints` | No | Returns `success:true` with empty body |
 | `threads` | `HandleThreads` | No | Always returns 1 thread: `C8051F380` |
-| `continue` | `HandleContinue` | Yes (`breakpoint`, async) | WDT disable → `AG_GOFORBRK` → background `WaitAndSendStopped` |
-| `next` | `HandleNext` | Yes (`step`, async) | Reads opcode at PC, computes next addr → `AG_GOTILADR` |
+| `continue` | `HandleContinue` | Yes (`breakpoint`, async) | WDT disable → `AG_GOFORBRK` → halt via HWND PostMessage |
+| `next` | `HandleNext` | Yes (`step`, async) | Reads opcode at PC; detects LCALL/ACALL → temp BP at return addr + `AG_GOFORBRK`; otherwise `AG_GOTILADR` |
 | `stepIn` | `HandleStepIn` | Yes (`step`, async) | `AG_NSTEP` single instruction |
-| `pause` | `HandlePause` | Yes (`pause`, async) | `AG_STOPRUN` → background `WaitAndSendStopped` |
+| `stepOut` | `HandleStepOut` | Yes (`step`, async) | Reads return address from stack (PCH/PCL), sets temp BP, runs `AG_GOFORBRK` |
+| `pause` | `HandlePause` | Yes (`pause`, async) | `AG_STOPRUN` → halt detection |
 | `stackTrace` | `HandleStackTrace` | No | Single frame; uses symtab for name/source/line |
-| `scopes` | `HandleScopes` | No | 5 scopes: Registers, CODE, XDATA, DATA, IDATA |
-| `variables` | `HandleVariables` | No | Registers from RG51; memory from `AG_MemAcc` (256 bytes per scope) |
+| `scopes` | `HandleScopes` | No | 6 scopes: Locals (conditional), Registers, CODE, XDATA, DATA, IDATA |
+| `variables` | `HandleVariables` | No | Locals from m51 PROC info; Registers from RG51; memory from `AG_MemAcc` (256 bytes per scope) |
 | `readMemory` | `HandleReadMemory` | No | Encoded `mSpace<<24 \| addr`; base64 response |
+| `evaluate` | `HandleEvaluate` | No | Local variables, SFR names, register names, DPTR, hex addresses, PUBLIC symbols |
+| `source` | `HandleSource` | No | Returns source file content for files without a local path |
 
 ### Not Implemented (fallback returns `success:false`)
 
 | DAP Command | Priority | Needed? | Notes |
 |---|---|---|---|
-| `setExceptionBreakpoints` | **HIGH** | Yes — VS Code sends this during init | Must return `success:true` with empty body. Returning an error may confuse some VS Code versions. |
-| `stepOut` | Medium | Nice-to-have | 8051 has no standard frame pointer; could implement as "run to return address" by reading stack. Not critical. |
-| `evaluate` | Medium | Nice-to-have | Would enable watch expressions, hover, and REPL. Requires SFR/register/memory expression parser. |
 | `setVariable` | Medium | Nice-to-have | Would allow editing register/memory values from the Variables panel. |
 | `disassemble` | Medium | Nice-to-have | Would enable the Disassembly view. Requires 8051 instruction decoder. |
 | `setFunctionBreakpoints` | Low | No | We have no function-name→address resolution that can't already be done via source BPs. |
 | `setInstructionBreakpoints` | Low | No | For disassembly-view BPs. Requires `disassemble` first. |
 | `attach` | Low | No | Our model is always launch (flash+debug). |
 | `restart` | Low | No | User can just F5 again; server handles re-launch. |
-| `completions` | Low | No | REPL auto-complete. Requires `evaluate` first. |
-| `source` | Low | No | Source is loaded from local filesystem by VS Code directly. |
+| `completions` | Low | No | REPL auto-complete. |
 | `modules` | Low | No | Single-module MCU; no dynamic loading. |
 | `loadedSources` | Low | No | Would list all source files; nice but not critical. |
 | `writeMemory` | Low | Nice-to-have | Would enable memory editing in the Memory view. |
-| `goto` / `gotoTargets` | Low | No | Set-next-statement. AGDI supports it (`AG_GoStep` with direct address) but low priority. |
+| `goto` / `gotoTargets` | Low | No | Set-next-statement. AGDI supports it but low priority. |
 
 ---
 
@@ -57,24 +57,26 @@ and the mock-debug reference implementation.
 
 From `MakeCapabilities()` in `dap_types.h`:
 
-| Capability | Value | Mock-debug equivalent |
+| Capability | Value | Notes |
 |---|---|---|
-| `supportsConfigurationDoneRequest` | `true` | `true` |
-| `supportsSetBreakpointsRequest` | `true` | *(implicit)* |
-| `supportsContinueRequest` | `true` | *(implicit)* |
-| `supportsNextRequest` | `true` | *(implicit)* |
-| `supportsStepInRequest` | `true` | *(implicit)* |
-| `supportsPauseRequest` | `true` | *(not set — mock-debug has no pause)* |
-| `supportsDisconnectRequest` | `true` | *(implicit)* |
-| `supportsReadMemoryRequest` | `true` | `true` |
+| `supportsConfigurationDoneRequest` | `true` | |
+| `supportsSetBreakpointsRequest` | `true` | |
+| `supportsContinueRequest` | `true` | |
+| `supportsNextRequest` | `true` | Step-over with CALL detection |
+| `supportsStepInRequest` | `true` | Single-instruction step |
+| `supportsStepOutRequest` | `true` | Reads return addr from 8051 stack |
+| `supportsPauseRequest` | `true` | |
+| `supportsDisconnectRequest` | `true` | |
+| `supportsReadMemoryRequest` | `true` | |
+| `supportsEvaluateForHovers` | `true` | Local vars, SFRs, registers, symbols |
+| `supportsTerminateRequest` | `false` | Aliased internally to disconnect |
+| `supportsRestartRequest` | `false` | |
 
 ### Capabilities We Should Add
 
 | Capability | Why |
 |---|---|
-| `supportsStepBack` | `false` — explicitly declare we don't support it |
 | `supportsValueFormattingOptions` | `true` — we already format hex; could support decimal toggle |
-| `supportsTerminateRequest` | `true` — we alias `terminate` to `disconnect` already |
 
 ### Capabilities We Don't Need (mock-debug has, we skip)
 
@@ -122,29 +124,17 @@ From `MakeCapabilities()` in `dap_types.h`:
 - **Activation:** `onDebugResolve:silabs8051`
 - **Launch properties:** `program` (required), `noDebug`, `noErase`
 - **Snippets:** 3 (Debug, Flash Only, Flash no-erase)
+- **Breakpoints contribution:** `c`, `a51` — gutter dots shown for C and assembly files
 
 ### Missing vs. Mock-Debug Reference
 
 | Feature | Mock-debug | Our extension | Priority |
 |---|---|---|---|
-| `breakpoints` contribution | `[{language:"markdown"}]` | **Not set** | **HIGH** — without this, VS Code won't show the BP gutter for C files |
 | `DebugConfigurationProvider` | `resolveDebugConfiguration()` | **Not present** | Medium — auto-fills launch config when missing |
 | Commands (debug/run file) | 3 commands with menu entries | None | Low |
 | Dynamic config provider | Yes | No | Low |
-| `EvaluatableExpressionProvider` | Yes (for hover) | No | Low (needs `evaluate` handler) |
-| `InlineValuesProvider` | Yes | No | Low (needs variable resolution) |
-
-### Immediate Extension Fix Needed
-
-Add a `breakpoints` contribution to `package.json` so VS Code shows the breakpoint
-gutter for C and assembly files:
-
-```json
-"breakpoints": [
-    { "language": "c" },
-    { "language": "a51" }
-]
-```
+| `EvaluatableExpressionProvider` | Yes (for hover) | No | Low |
+| `InlineValuesProvider` | Yes | No | Low |
 
 ---
 
@@ -152,96 +142,70 @@ gutter for C and assembly files:
 
 ### BUG-1: Pause Button Does Not Work
 
-**Severity:** High  
+**Severity:** Medium  
+**Status:** Open — needs investigation.  
 **Symptom:** After continue, clicking the VS Code pause button has no visible effect.
 The server log shows no `[DAP] -> pause` request arriving.
 
-**Observed behavior:**
-```
-[DAP]  -> continue (seq=7)
-[DEBUG] WDT disable sequence written to WDTCN (0x97)
-[CBK]  nCode=0x0008 vp=1019E21C
-[DLL]  Updating target...
-[CBK]  nCode=0x0008 vp=101C1088
-[DLL]  Running...
-(... silence — no pause request received ...)
-```
-
 **Analysis:**
-The server code for `HandlePause` is correct: it calls `AG_GoStep(AG_STOPRUN)` and
-spawns `WaitAndSendStopped("pause")`. But the `pause` request never arrives over TCP.
+The server code for `HandlePause` is correct: it calls `AG_GoStep(AG_STOPRUN)`.
+But the `pause` request never arrives over TCP.
 
-**Possible causes (in order of likelihood):**
-1. VS Code is not sending the `pause` request — the debug toolbar may not transition
-   to "running" state (pause button not shown / enabled).
-2. The TCP recv loop is blocked — unlikely since it successfully handled seq 1–7.
-3. VS Code sends it but it's lost in transit — very unlikely with TCP.
+**Likely cause:** VS Code may not transition the toolbar to "running" state correctly,
+so the pause button is not shown or enabled.
 
 **Diagnostic steps:**
-1. Enable VS Code DAP trace logging: set `"trace": true` in launch.json or run
-   `Developer: Toggle DAP Tracing` from the command palette. Check the DAP trace
-   output for whether `pause` is sent.
-2. Check the VS Code debug toolbar: after clicking Continue, does the toolbar show
-   a pause (⏸) button or still show continue/step buttons?
-3. Add a heartbeat log to the recv loop: before `RecvMessage()` returns, log
-   `"[TCP] waiting for next message..."` to confirm the dispatch loop is alive.
-4. Test with a DAP client tool (e.g., the test scripts in `scripts/`) to send a
-   raw `pause` request and confirm the server handles it.
-
-**Race condition note:** When `pause` is received while a `WaitAndSendStopped("breakpoint")`
-thread from `continue` is active, both threads wait on the same auto-reset halt event.
-Only one gets it; the other times out and sends a duplicate `stopped` event. Fix: use
-a cancellation flag to prevent the old thread from sending a stale `stopped` event.
+1. Enable VS Code DAP trace logging: set `"trace": true` in launch.json.
+2. Check the VS Code debug toolbar state after clicking Continue.
 
 ---
 
-### BUG-2: OMF-51 Line Number Parsing Returns 0 Entries
+### BUG-4: Local Variables Show 0x00 (Under Investigation)
 
-**Severity:** High  
-**Symptom:** `[SYM] OMF-51: 0 line entries loaded`
+**Severity:** Medium  
+**Status:** Open — investigating.  
+**Symptom:** Locals panel shows all variables as `0x00` even when they should have values.
 
-**Root cause:** `ParseOmfAbs()` in `symtab.cpp` searches for OMF-51 record type `0xE2`
-(Keil line number table). The BL51 absolute file (`output/SoftStep`, no extension)
-contains **only** record type `0x70` (Keil MODHDR) — one per source module. The body
-of each `0x70` record is a null-terminated compiler invocation string. No `0xE2` records
-exist in this file.
+**Possible causes:**
+1. The m51 PROC/SYMBOL addresses may not match what the linker actually assigned.
+2. Only 8-bit reads are performed — Keil C51 `int` is 16 bits but we read only 1 byte.
+3. AG_MemAcc may require a different address encoding for local variable reads.
+4. Variables may be in registers (not in RAM) and the m51 SYMBOL entry may be stale.
 
-**What we know:**
-- The abs file is ~2.1 MB, all `0x70` records (confirmed by `scripts/dump_omf.py`).
-- Individual `.obj` files (`output/*.obj`) DO contain records `0x24` (LINNUM/source
-  filename reference) and `0x23` (scope/debug) that likely contain line number data.
-- `.lst` files have no inline addresses — format is `line level source` with only
-  code size summary at the end.
-
-**Fix approach:**
-1. Parse individual `.obj` files from the `output/` directory.
-2. From each `.obj` file: extract the source filename from the `0x24` record, then
-   decode addr→line pairs from `0x23` and/or `0x62`/`0x63`/`0x64` (Keil debug
-   extension) records.
-3. Rewrite `ParseOmfAbs()` to iterate over `output/*.obj` files instead of the
-   linked abs file.
-4. Alternatively: investigate whether the abs file has non-0x70 records past the
-   500-record dump limit (the dump script stopped early).
+**Next steps:** Verify the m51 addresses match the actual DATA/XDATA layout by
+comparing with the .lst file output. Consider reading 2 bytes for `int` types.
 
 ---
 
-### BUG-3: Step Halt Detection (Resolved with Workaround)
+### BUG-5: Watch Shows 8-Bit Values for 16-Bit `int` Variables
 
-**Severity:** Medium (workaround in place)  
-**Symptom (original):** After `stepIn` (F11), `WaitForHalt` timed out after 30 seconds
-despite the DLL printing `"Target Halted..."`.
+**Severity:** Low  
+**Status:** Open.  
+**Symptom:** When watching a Keil C51 `int` variable (16-bit), the evaluate handler
+reads only 1 byte and displays an 8-bit value.
 
-**Root cause:** The DLL does not fire `AG_RUNSTOP` (0x0011) after single-step completion.
-The `"Target Halted..."` message arrives via `AG_CB_MSGSTRING` (callback nCode=0x0008),
-which was originally only logged — not used for halt signalling.
+**Root cause:** The m51 symbol table does not include type information (only name,
+memory space, and address). All variables are treated as 8-bit.
 
-**Fix applied:** Added "Halted"/"halted" substring detection in the `AG_CB_MSGSTRING`
-handler in `DapAgdiCallback`. When detected, `SignalHalt("stopped")` is called. This
-provides a reliable halt signal path alongside the existing `AG_RUNSTOP` and PostMessage
-paths.
+**Fix approach:** Parse the Keil `.lst` or `.obj` files for type metadata, or add
+heuristics based on variable name conventions. Alternatively, read 2 bytes and
+display both 8-bit and 16-bit interpretations.
 
-**Status:** Workaround is in `run_control.cpp`. Step-into, step-over, and continue
-should now receive the halt signal promptly. Needs HW re-verification.
+---
+
+### Resolved Bugs
+
+| Bug | Description | Resolution |
+|-----|-------------|------------|
+| BUG-2 | OMF-51 line parsing returns 0 entries | **Resolved** — switched to m51 LINE# parsing; 8051 line-level source mapping now works |
+| BUG-3 | Step halt detection timeout | **Resolved** — triple-path halt detection (RUNSTOP + MSGSTRING + PostMessage) |
+| — | AG_MemAcc stack corruption | **Resolved** — DLL writes past requested byte count; all single-byte reads now use 4-byte padded buffers |
+| — | Step-over infinite loop | **Resolved** — HandleNext detects LCALL/ACALL opcodes and sets temp breakpoints instead of single-stepping through called functions |
+| — | Step-out byte swap | **Resolved** — 8051 LCALL pushes PCL first, PCH second; corrected read order |
+| — | Register threading race | **Resolved** — DLL functions called only when GoStep is not active |
+| — | Slow initial halt after launch | **Resolved** — SignalHalt("reset") called after AGDI_RESET |
+| — | BP pool stale crash | **Resolved** — ClearPool() before INITBPHEAD on each session start |
+| — | Step-in line offset | **Resolved** — line entries sorted by (addr, line) so highest line wins |
 
 ---
 
@@ -272,10 +236,13 @@ should now receive the halt signal promptly. Needs HW re-verification.
       `AG_GoStep(AG_STOPRUN, 0, nullptr)`. This needs HW verification that the DLL
       accepts it and halts the target.
 
-### Medium (Feature Parity)
+### Medium (Feature Improvements)
 
-- [ ] **Add `evaluate` handler** — Parse simple expressions: SFR names, register
-      names, `xdata[addr]`, `code[addr]`. Return formatted values for watch/hover.
+- [ ] **Multi-byte variable display** — Keil C51 `int` is 16-bit; `long` is 32-bit.
+      Currently all locals/watch values are read as single bytes. Need type info from
+      `.lst` or `.obj` files, or a simple heuristic (read 2 bytes for `int`).
+- [ ] **Investigate locals showing 0x00** — Locals panel shows all zeros. May be an
+      address mapping issue or the variables may live in registers, not RAM.
 - [ ] **Add `setVariable` handler** — Allow editing registers and memory from the
       Variables panel via `AG_RegAcc` and `AG_MemAcc(AG_WRITE)`.
 - [ ] **Add `disassemble` handler** — Use the `opcodes8051.h` instruction length
@@ -286,9 +253,6 @@ should now receive the halt signal promptly. Needs HW re-verification.
 
 ### Low (Polish)
 
-- [ ] **Add `supportsTerminateRequest: true`** to capabilities (already handled via alias).
-- [ ] **Improve stack frame** — Show function arguments, local variables (requires
-      parsing Keil debug info from `.obj` files beyond line numbers).
 - [ ] **Memory view chunking** — Currently returns 256 bytes per memory scope; support
       paging via `readMemory` with arbitrary offset/count.
 - [ ] **Progress events** — Send `progressStart`/`progressUpdate`/`progressEnd` during
@@ -305,27 +269,26 @@ should now receive the halt signal promptly. Needs HW re-verification.
 ```
 Main Thread (Win32 message pump)
   └─ GetMessageA / DispatchMessageA loop
-  └─ HwndMsgProc: receives PostMessage from DLL → SignalHalt()
+  └─ HwndMsgProc(WM_USER+3): GoStep(AG_GOFORBRK) → ReadRegisters() → SignalHalt()
 
-Worker Thread (DAP server)
+Reader Thread (DAP server)
   └─ RecvMessage → Dispatch → Handler → SendResponse/SendEvent
-  └─ GoStep calls → DLL callbacks fire synchronously on this thread
-  └─ WaitAndSendStopped detached threads: block on halt event
+  └─ Posts WM_USER+3 to main thread for run-control operations
 
-DLL Internal Thread(s)
-  └─ May call DapAgdiCallback from its own threads
-  └─ PostMessage to main thread's HWND_MESSAGE window
+DLL Callback Thread(s)
+  └─ DapAgdiCallback — register snapshots, messages, flash params
+  └─ AG_CB_INITREGV delivers RG51 register snapshot
 ```
 
-### Halt Detection (Triple Path)
+### Halt Detection
 
-1. **AG_RUNSTOP callback** — `DapAgdiCallback(0x0011, ...)` → `SignalHalt("step")`
-2. **MSGSTRING "Halted"** — `DapAgdiCallback(AG_CB_MSGSTRING, "...Halted...")` → `SignalHalt("stopped")`
-3. **PostMessage** — `HwndMsgProc(WM_USER+1)` → `SignalHalt("breakpoint")`
+Run-control commands (continue, next, stepOut) post `WM_USER+3` to the main thread.
+The main thread calls `GoStep(AG_GOFORBRK)` which blocks until the DLL returns.
+After GoStep returns, `ReadRegisters()` + `SignalHalt("stopped")` are called
+immediately on the main thread. This is the **single halt signal path** for GOFORBRK
+operations, eliminating the earlier race conditions.
 
-All three set the same auto-reset Win32 event. `WaitForHalt(timeoutMs)` blocks on
-this event. Redundant signals are harmless (event is auto-reset, only one waiter
-wakes per signal).
+For `stepIn`, `AG_NSTEP` is used and halt is detected via `AG_CB_INITREGV` callback.
 
 ### DLL Callback Codes Observed
 
@@ -357,12 +320,12 @@ lifecycle. Key patterns we should adopt:
    `breakpoint`, `pause`.
 
 4. **Stack frame `source` field** — mock-debug always includes a `Source` object with
-   `name` and `path`. We include it only when symtab has line info (which is currently
-   never due to BUG-2). This means VS Code can't navigate to source on halt.
+   `name` and `path`. We now include it when symtab has line info — source navigation
+   on halt works for all functions that have LINE# entries in the m51 file.
 
 5. **No `pauseRequest` in mock-debug** — the reference does NOT implement pause.
-   Our implementation is therefore going beyond the reference. The pause mechanism
-   relies on `AG_GoStep(AG_STOPRUN)` which needs HW verification.
+   Our implementation is therefore going beyond the reference.
 
 6. **Capabilities differences** — mock-debug advertises 20 capabilities; we advertise
-   8. The important ones we're missing are listed in Section 2 above.
+   12. The remaining differences are mostly features we don't need (step-back,
+   data breakpoints, exception filters).

@@ -33,6 +33,9 @@ public:
     // Current program counter.
     uint32_t PC() const;
 
+    // Current stack pointer.
+    uint8_t SP() const;
+
     // Format all RG51 fields into a DAP 'variables' array.
     nlohmann::json ToVariables() const;
 

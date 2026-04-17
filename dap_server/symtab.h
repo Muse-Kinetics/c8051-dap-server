@@ -5,17 +5,15 @@
 //
 // SymbolTable — source-level debug info for the SoftStep 8051 firmware.
 //
-// Two data sources (loaded at debug session start):
-//   1. BL51 map file  (<image>.m51)  — text file, gives PUBLIC symbol addresses
-//      for function-level name resolution.
-//   2. OMF-51 absolute file (<image>, no extension) — binary file produced by BL51,
-//      contains Keil C51 extension records (type 0x24 for source filenames,
-//      type 0x22 subtype 0x03 for line numbers) with segment-relative addresses
-//      converted to absolute addresses.  Gives line-level resolution.
+// Data source (loaded at debug session start):
+//   BL51 map file  (<image>.m51)  — text file.
+//   Provides:
+//     1. PUBLIC symbol addresses — for function-level name resolution.
+//     2. LINE# entries (within MODULE / PROC blocks) — for line-level
+//        source navigation.  Each MODULE corresponds to a source file;
+//        the MODULE name maps to a filename via case-insensitive search.
 //
-// Both sources are optional.  If only the m51 file is available, LookupLine()
-// returns nullopt but LookupSymbol() returns function names.  If neither is
-// available, all lookups return empty/nullopt.
+// If the m51 file is not available, all lookups return empty/nullopt.
 //
 // Thread safety: Load() must be called before the debug session starts.
 // All const accessors are safe to call concurrently once loading is complete.
@@ -34,6 +32,18 @@
 struct SourceLocation {
     std::string file;   // absolute path to source file
     int         line;   // 1-based line number
+};
+
+// ---------------------------------------------------------------------------
+// LocalVariable — a C variable scoped to a PROC in the m51 map
+// ---------------------------------------------------------------------------
+
+struct LocalVariable {
+    std::string name;        // e.g. "status", "i"
+    uint16_t    mSpace;      // amDATA (0xF0) or amXDATA (0x01)
+    uint32_t    addr;        // address within that space
+    uint32_t    procStart;   // first code address of the containing PROC
+    uint32_t    procEnd;     // last code address + 1 of the containing PROC
 };
 
 // ---------------------------------------------------------------------------
@@ -75,9 +85,20 @@ public:
     // Returns nullopt if no entry matches.
     std::optional<uint32_t> LookupAddress(const std::string& filename, int line) const;
 
+    // Symbol name → code address (case-insensitive).
+    // Used by the evaluate handler for watch expressions.
+    // Returns nullopt if no PUBLIC symbol matches.
+    std::optional<uint32_t> LookupSymbolByName(const std::string& name) const;
+
+    // Return all local variables whose PROC range contains `pc`.
+    std::vector<LocalVariable> LookupLocals(uint32_t pc) const;
+
+    // Look up a local variable by name in the PROC containing `pc`.
+    // Returns nullopt if not found.
+    std::optional<LocalVariable> LookupLocalByName(const std::string& name, uint32_t pc) const;
+
 private:
     void ParseM51(const std::string& m51Path, const std::string& buildRoot);
-    void ParseOmfAbs(const std::string& absPath, const std::string& buildRoot);
 
     // Resolve a source filename (possibly relative) to an absolute path.
     // Tries: absolute, relative to buildRoot, relative to parent of buildRoot.
@@ -105,6 +126,9 @@ private:
     };
     // Sorted ascending by addr.
     std::vector<LineEntry> m_lines;
+
+    // Local variables scoped to PROCs.
+    std::vector<LocalVariable> m_locals;
 
     bool m_loaded = false;
 };
