@@ -44,6 +44,18 @@ struct LocalVariable {
     uint32_t    addr;        // address within that space
     uint32_t    procStart;   // first code address of the containing PROC
     uint32_t    procEnd;     // last code address + 1 of the containing PROC
+    uint8_t     size;        // inferred byte count (1/2/4), from m51 address gaps
+};
+
+// ---------------------------------------------------------------------------
+// GlobalVariable — a PUBLIC data symbol at module level in the m51 map
+// ---------------------------------------------------------------------------
+
+struct GlobalVariable {
+    std::string name;        // e.g. "mode_preset_change"
+    uint16_t    mSpace;      // amDATA (0xF0) or amXDATA (0x01)
+    uint32_t    addr;        // address within that space
+    uint8_t     size;        // inferred byte count (1/2/4)
 };
 
 // ---------------------------------------------------------------------------
@@ -97,6 +109,26 @@ public:
     // Returns nullopt if not found.
     std::optional<LocalVariable> LookupLocalByName(const std::string& name, uint32_t pc) const;
 
+    // Look up a global variable by name (case-insensitive).
+    // Returns nullopt if not found.
+    std::optional<GlobalVariable> LookupGlobalByName(const std::string& name) const;
+
+    // Return the code address of the next LINE# entry after `pc`.
+    // Used for fast source-level stepping via temp breakpoints.
+    // Returns nullopt if pc is at or past the last line entry.
+    std::optional<uint32_t> NextLineAddr(uint32_t pc) const;
+
+    // Return true if the caller function contains a direct ACALL/LCALL to the
+    // callee function in the loaded HEX image.
+    bool CallsFunction(const std::string& callerName, const std::string& calleeName) const;
+
+    // Find a short static call path from ancestor -> ... -> callee.
+    // The returned vector contains only the intermediate function names,
+    // excluding the ancestor and callee themselves.
+    std::vector<std::string> FindCallPath(const std::string& ancestorName,
+                                          const std::string& calleeName,
+                                          int maxDepth = 3) const;
+
 private:
     void ParseM51(const std::string& m51Path, const std::string& buildRoot);
 
@@ -129,6 +161,9 @@ private:
 
     // Local variables scoped to PROCs.
     std::vector<LocalVariable> m_locals;
+
+    // Global variables (PUBLIC data symbols at module level).
+    std::vector<GlobalVariable> m_globals;
 
     bool m_loaded = false;
 };

@@ -70,6 +70,7 @@ inline nlohmann::json MakeCapabilities()
         {"supportsGotoTargetsRequest",       false},
         {"supportsCompletionsRequest",       false},
         {"supportsModulesRequest",           false},
+        {"supportsSteppingGranularity",        true},
     };
 }
 

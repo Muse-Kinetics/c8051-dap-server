@@ -9,7 +9,7 @@
 
 cmake_minimum_required(VERSION 3.20)
 
-project(C8051_dap_server VERSION 0.10.0 LANGUAGES CXX)
+project(C8051_dap_server VERSION 0.11.0 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "This project targets Windows only (SiC8051F.dll is a 32-bit Windows DLL).")
@@ -59,6 +59,17 @@ add_executable(dap_server
   "${CMAKE_CURRENT_SOURCE_DIR}/dap_server/registers.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/dap_server/symtab.cpp"
 )
+
+# Force main.cpp to rebuild every time so __DATE__/__TIME__ in the splash
+# banner always reflects the actual build timestamp.
+# add_custom_target (no OUTPUT) is always considered out-of-date by CMake,
+# so it runs on every build and touches main.cpp before the compile step.
+add_custom_target(touch_main ALL
+  COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_CURRENT_SOURCE_DIR}/dap_server/main.cpp"
+  COMMENT "Touching main.cpp to refresh build timestamp"
+  VERBATIM
+)
+add_dependencies(dap_server touch_main)
 
 target_include_directories(dap_server PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/dap_server"

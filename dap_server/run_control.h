@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <mutex>
 #include <string>
 
 #include "agdi.h"
@@ -77,6 +78,9 @@ public:
     UINT               GetMsgToken() const { return m_msgToken; }
     bool               IsSessionActive() const { return m_sessionActive; }
     bool               IsNoErase()       const { return m_noErase; }
+    std::string        LastDllError() const;
+    void               SetLastDllError(const std::string& msg);
+    void               ClearLastDllError();
 
     // Post a stop-request to the HWND.  Safe to call from any thread.
     // The HwndMsgProc will call AG_GoStep(AG_STOPRUN) on the AGDI thread.
@@ -98,6 +102,24 @@ public:
     // Read registers from hardware using AG_AllReg + saved RegDsc.
     // Must be called when the target is halted.
     void ReadRegisters();
+
+    // Lightweight: read only PC and SP (3 USB calls vs 16).
+    // Use inside step loops where only PC/SP are needed.
+    void ReadPcSp();
+
+    // Ultra-lightweight: read only PC (2 USB calls).
+    // Use inside step-in loops where SP is not needed.
+    void ReadPc();
+
+    // Fast post-GoStep: read PC + SP without AG_AllReg (1 USB call).
+    // AG_RegAcc(0x500) reads PC from the DLL's already-refreshed cache.
+    // AG_MemAcc reads SP directly from target hardware.
+    // Skips AG_AllReg since GoStep already refreshed the DLL's cache.
+    void ReadPcSpCached();
+
+    // Fastest post-GoStep: read only PC from DLL cache (0 USB calls).
+    // Use inside step-in loops where SP is not needed.
+    void ReadPcCached();
 
     // Save the RegDsc passed in the AG_CB_INITREGV callback.
     // The struct is a stack local in the DLL, but its internal pointers
@@ -138,6 +160,8 @@ private:
     bool        m_noErase       = false;
     bool        m_isFlashOnly   = false;
     std::string m_haltReason    = "entry";
+    mutable std::mutex m_stateMutex;
+    std::string m_lastDllError;
 
     // Saved copy of the RegDsc from AG_CB_INITREGV callback.
     RegDsc      m_savedRegDsc{};

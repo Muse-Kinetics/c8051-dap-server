@@ -1,4 +1,4 @@
-# scripts/start_server.ps1
+﻿# scripts/start_server.ps1
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 KMI Music, Inc. / Eric Bateman
 #

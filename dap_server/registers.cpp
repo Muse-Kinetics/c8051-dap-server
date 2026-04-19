@@ -34,6 +34,14 @@ void RegisterCache::Update(const RG51& regs)
     m_valid = true;
 }
 
+void RegisterCache::UpdatePcSp(uint32_t pc, uint8_t sp)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_regs.nPC = pc;
+    m_regs.sp  = sp;
+    m_valid    = true;
+}
+
 uint32_t RegisterCache::PC() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);

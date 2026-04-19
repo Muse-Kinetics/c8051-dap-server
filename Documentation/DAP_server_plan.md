@@ -6,7 +6,7 @@ Build a Windows x86 DAP server that loads `SiC8051F.dll` directly, drives it thr
 the fully-decoded AGDI API, and serves the Microsoft Debug Adapter Protocol over TCP.
 A VSCode extension registers a `DebugAdapterDescriptorFactory` that connects to port 4711.
 
-**Status: Phases 1–9 complete and hardware-verified. Source-level debugging operational.**
+**Status: Phases 1–10 in progress. Source-level debugging operational. Call stack hardening active.**
 See `DAP_implementation_status.md` for detailed feature matrix and open bugs.
 
 This replaces the earlier GDB RSP concept. No GDB layer is involved.
@@ -157,7 +157,8 @@ background thread also receives `PostMessage(hWnd, msgToken, ...)` as a secondar
 | 6 | Breakpoints | ✅ Complete — address BPs HW tested; source BPs need line info |
 | 7 | Register and memory read, scopes | ✅ Complete — HW verified |
 | 8 | VSCode extension | ✅ Complete — working |
-| 9 | Source-level debug (symtab, line mapping) | 🔧 In progress — m51 symbols loaded; OMF line info TBD |
+| 9 | Source-level debug (symtab, line mapping) | ✅ Complete — m51 symbols, line mapping, locals, globals HW verified |
+| 10 | Call stack hardening | 🔧 In progress — physical unwinder + logical frame cache working; step-driven frame loss under active investigation |
 
 **Clean reconnect:** Fixed. Root cause was `byte_101DDF9C` internal DLL flag persisting
 across UNINIT within the same process. Fix: `FreeLibrary` + `LoadLibrary` in
@@ -166,10 +167,21 @@ across UNINIT within the same process. Fix: `FreeLibrary` + `LoadLibrary` in
 **Crash recovery:** Fixed. If the DAP client drops TCP without sending `disconnect`,
 `RunSession()` automatically calls `UninitAgdiSession()` before waiting for the next client.
 
-**Active known issue:** After halting at PC=0x0000 and pressing continue in VSCode, the
-target appears not to run. Likely the SoftStep firmware crashes immediately after debug
-reset because peripherals are in a different state than after power-on reset. Investigation
-needed: `AG_GOFORBRK` usage, watchdog timeout, USB PLL init sequence.
+**Resolved issue:** Target not running after halt at PC=0x0000 — fixed by disabling the
+watchdog timer (WDTCN sequence) before each `AG_GOFORBRK` call.
+
+**Active known issue — Phase 10:** In the direct step-driven path (step into a deeply
+nested call without first hitting a breakpoint), the physical 8051 stack sometimes only
+contains 2 frames (current function + main) because Keil C51 optimises away intermediate
+return addresses for inline or tail-call sequences. The logical frame cache and source-level
+call-edge fallback (`CallsFunction` + `FindCallPath` in `symtab.cpp`) partially recover
+missing callers but the source-scan window and cache preservation conditions are still
+being tuned. Breakpoint-driven paths show the full 5-frame stack correctly.
+
+**Active known issue — Autonomous launch:** `mcp_debug-mcp_start_debugging` fails because
+the launch configuration is embedded in the workspace `.code-workspace` file rather than
+a `.vscode/launch.json`. Use `run_vscode_command workbench.action.debug.start` (F5
+equivalent) instead. See `debugging_SOP.md` for the full autonomous workflow.
 
 ---
 

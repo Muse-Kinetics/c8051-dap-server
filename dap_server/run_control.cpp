@@ -14,8 +14,10 @@
 #include "dap_server.h"
 #include "log.h"
 
+#include <atomic>
 #include <cstring>
 #include <string>
+#include <thread>
 
 // Forward declaration — defined in dap_server.cpp, set when a session is active.
 extern DapServer* g_pServer;
@@ -32,6 +34,24 @@ static void SendOutput(const std::string& msg)
 }
 
 RunControl g_runControl;
+
+std::string RunControl::LastDllError() const
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    return m_lastDllError;
+}
+
+void RunControl::SetLastDllError(const std::string& msg)
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    m_lastDllError = msg;
+}
+
+void RunControl::ClearLastDllError()
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    m_lastDllError.clear();
+}
 
 // ---------------------------------------------------------------------------
 // SEH wrapper for INITFEATURES — must be a plain function (no C++ unwind)
@@ -100,6 +120,138 @@ static U32 CallInitFeatures(AgdiLoader& agdi, void* pFeatures)
 
 static constexpr char kWndClassName[] = "DapServerMsgWnd";
 
+namespace {
+
+std::atomic<bool> g_popupWatchRunning{false};
+std::thread g_popupWatchThread;
+
+using ShowWindowFn = BOOL(WINAPI*)(HWND, int);
+using CreateWindowExAFn = HWND(WINAPI*)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+
+static ShowWindowFn s_realShowWindow = nullptr;
+static CreateWindowExAFn s_realCreateWindowExA = nullptr;
+
+bool HookImportByName(HMODULE module, const char* importedDll, const char* funcName, void* replacement, void** original = nullptr)
+{
+    if (!module || !importedDll || !funcName || !replacement) return false;
+
+    auto* base = reinterpret_cast<BYTE*>(module);
+    auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return false;
+
+    auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+    for (; desc->Name; ++desc) {
+        const char* dllName = reinterpret_cast<const char*>(base + desc->Name);
+        if (_stricmp(dllName, importedDll) != 0) continue;
+
+        auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+        auto* orig  = desc->OriginalFirstThunk
+            ? reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk)
+            : thunk;
+
+        for (; orig->u1.AddressOfData; ++orig, ++thunk) {
+            if (IMAGE_SNAP_BY_ORDINAL(orig->u1.Ordinal)) continue;
+            auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + orig->u1.AddressOfData);
+            const char* name = reinterpret_cast<const char*>(byName->Name);
+            if (std::strcmp(name, funcName) != 0) continue;
+
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+                return false;
+            }
+            if (original) *original = reinterpret_cast<void*>(thunk->u1.Function);
+            thunk->u1.Function = reinterpret_cast<ULONG_PTR>(replacement);
+            VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &oldProtect);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+BOOL CALLBACK CollectPopupChildText(HWND hwnd, LPARAM lParam)
+{
+    auto* text = reinterpret_cast<std::string*>(lParam);
+    char cls[64] = {};
+    char buf[512] = {};
+    GetClassNameA(hwnd, cls, sizeof(cls));
+    GetWindowTextA(hwnd, buf, sizeof(buf));
+
+    if (!buf[0]) return TRUE;
+    if (_stricmp(cls, "Static") != 0 && _stricmp(cls, "Button") != 0) return TRUE;
+
+    if (!text->empty()) *text += " ";
+    *text += buf;
+    return TRUE;
+}
+
+bool CaptureAndCloseKnownDllPopup(HWND hwnd)
+{
+    if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) return false;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) return false;
+
+    char title[256] = {};
+    GetWindowTextA(hwnd, title, sizeof(title));
+
+    std::string body;
+    EnumChildWindows(hwnd, CollectPopupChildText, reinterpret_cast<LPARAM>(&body));
+
+    const bool isKnownPopup =
+        (std::strstr(title, "SiC8051F") != nullptr && !body.empty()) ||
+        body.find("Communication failure") != std::string::npos ||
+        body.find("Reset cable and try again") != std::string::npos ||
+        body.find("Target failed to respond") != std::string::npos ||
+        body.find("System is being disconnected") != std::string::npos ||
+        body.find("Command failed after target halt") != std::string::npos;
+
+    if (!isKnownPopup) return false;
+
+    std::string msg = std::string(title[0] ? title : "SiC8051F") + ": " + body;
+    LOG("[SUPPRESS] DLL popup window: %s\n", msg.c_str());
+    g_runControl.SetLastDllError(msg);
+    SendOutput(std::string("[SUPPRESS] DLL popup window: ") + msg + "\n");
+
+    PostMessageA(hwnd, WM_COMMAND, IDOK, 0);
+    PostMessageA(hwnd, WM_CLOSE, 0, 0);
+    return true;
+}
+
+BOOL CALLBACK EnumPopupWindowsProc(HWND hwnd, LPARAM)
+{
+    CaptureAndCloseKnownDllPopup(hwnd);
+    return TRUE;
+}
+
+void StartPopupWatcher()
+{
+    bool expected = false;
+    if (!g_popupWatchRunning.compare_exchange_strong(expected, true)) return;
+
+    g_popupWatchThread = std::thread([]() {
+        while (g_popupWatchRunning.load()) {
+            EnumWindows(EnumPopupWindowsProc, 0);
+            Sleep(25);
+        }
+    });
+}
+
+void StopPopupWatcher()
+{
+    const bool wasRunning = g_popupWatchRunning.exchange(false);
+    if (wasRunning && g_popupWatchThread.joinable()) {
+        g_popupWatchThread.join();
+    }
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // DapAgdiCallback — called on SiC8051F.dll's internal thread
 // ---------------------------------------------------------------------------
@@ -107,7 +259,7 @@ static constexpr char kWndClassName[] = "DapServerMsgWnd";
 extern "C" U32 DapAgdiCallback(U32 nCode, void* vp)
 {
     // Log all codes so we can see what the DLL actually sends.
-    LOG("[CBK]  nCode=0x%04X vp=%p\n", nCode, vp);
+    LOGV("[CBK]  nCode=0x%04X vp=%p\n", nCode, vp);
     switch (nCode) {
     case AG_CB_INITREGV:
         // The DLL sends this once during init with a stack-local RegDsc.
@@ -136,8 +288,14 @@ extern "C" U32 DapAgdiCallback(U32 nCode, void* vp)
             std::string msg = static_cast<const char*>(vp);
             while (!msg.empty() && (msg.back() == ' ' || msg.back() == '\r' || msg.back() == '\n'))
                 msg.pop_back();
-            LOG("[DLL]  %s\n", msg.c_str());
-            SendOutput(msg + "\n");
+            LOGV("[DLL]  %s\n", msg.c_str());
+            if (msg.find("Communication failure") != std::string::npos ||
+                msg.find("Reset cable and try again") != std::string::npos ||
+                msg.find("Target failed to respond") != std::string::npos ||
+                msg.find("System is being disconnected") != std::string::npos) {
+                g_runControl.SetLastDllError(std::string("SiC8051F: ") + msg);
+                SendOutput(std::string("[DLL] ") + msg + "\n");
+            }
 
             // Note: "Target Halted" appears in this callback BEFORE GoStep returns.
             // Do NOT signal the halt event here — GoStep is still on the stack
@@ -503,56 +661,90 @@ bool RunControl::InitAgdiSession(bool isFlash, bool noErase)
         //     and suppress SW_SHOW for dialog windows whose parent is our hidden HWND,
         //     silently redirecting to SW_HIDE so the dialog is never visible.
         {
-            using ShowWindowFn = BOOL(WINAPI*)(HWND, int);
-            static ShowWindowFn s_realShowWindow = nullptr;
-            void** pSWEntry = reinterpret_cast<void**>(base + 0x843B8);
-            s_realShowWindow = reinterpret_cast<ShowWindowFn>(*pSWEntry);
-            // Use a proper __stdcall (WINAPI) static method — lambdas are __cdecl
-            // and would corrupt the stack on x86 when called via the IAT.
             struct SW {
                 static BOOL WINAPI Stub(HWND hw, int nCmdShow) {
                     if (nCmdShow == SW_SHOW || nCmdShow == SW_SHOWNA || nCmdShow == SW_SHOWNORMAL) {
                         LOG("[SUPPRESS] DLL progress window hidden (ShowWindow SW_SHOW -> SW_HIDE, hwnd=%p)\n", (void*)hw);
                         nCmdShow = SW_HIDE;
                     }
-                    return s_realShowWindow(hw, nCmdShow);
+                    return s_realShowWindow ? s_realShowWindow(hw, nCmdShow) : FALSE;
                 }
             };
-            if (VirtualProtect(pSWEntry, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
-                *pSWEntry = reinterpret_cast<void*>(&SW::Stub);
-                VirtualProtect(pSWEntry, sizeof(void*), oldProtect, &oldProtect);
-                LOGV("[PATCH] ShowWindow IAT hooked at %p\n", pSWEntry);
+            if (HookImportByName(static_cast<HMODULE>(g_agdi.Module()), "USER32.dll", "ShowWindow",
+                                 reinterpret_cast<void*>(&SW::Stub), reinterpret_cast<void**>(&s_realShowWindow))) {
+                LOGV("[PATCH] ShowWindow IAT hooked by name\n");
             }
         }
 
-        // (c) Replace MessageBoxA in the DLL's IAT (RVA 0x84440) with a stub
-        //     that returns IDOK (1) immediately.
+        // (c) Replace MessageBoxA in the DLL's IAT with a stub that returns IDOK immediately.
         struct MB {
             static int WINAPI Stub(HWND, LPCSTR text, LPCSTR caption, UINT) {
                 std::string msg = std::string(caption ? caption : "") + ": " + (text ? text : "");
                 LOG("[SUPPRESS] DLL MessageBox: [%s] %s\n", caption ? caption : "", text ? text : "");
-                SendOutput(msg + "\n");
+                g_runControl.SetLastDllError(msg);
+                SendOutput(std::string("[SUPPRESS] DLL MessageBox: ") + msg + "\n");
                 return IDOK;
             }
         };
-        void** pIatEntry = reinterpret_cast<void**>(base + 0x84440);
-        if (VirtualProtect(pIatEntry, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
-            *pIatEntry = reinterpret_cast<void*>(&MB::Stub);
-            VirtualProtect(pIatEntry, sizeof(void*), oldProtect, &oldProtect);
-            LOGV("[PATCH] MessageBoxA IAT hooked at %p\n", pIatEntry);
+        if (HookImportByName(static_cast<HMODULE>(g_agdi.Module()), "USER32.dll", "MessageBoxA",
+                             reinterpret_cast<void*>(&MB::Stub), nullptr)) {
+            LOGV("[PATCH] MessageBoxA IAT hooked by name\n");
+        }
+
+        // (d) Some SiLabs dialogs are created directly with CreateWindowExA using a visible dialog style,
+        //     which bypasses the ShowWindow hook. Remove WS_VISIBLE up front for those windows.
+        struct CW {
+            static HWND WINAPI Stub(DWORD exStyle, LPCSTR className, LPCSTR windowName, DWORD style,
+                                    int x, int y, int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
+                bool isDialogAtom = reinterpret_cast<ULONG_PTR>(className) <= 0xFFFF && LOWORD(className) == 32770;
+                bool isDialogName = className && reinterpret_cast<ULONG_PTR>(className) > 0xFFFF && std::strcmp(className, "#32770") == 0;
+                bool isSiLabsTitle = windowName && std::strstr(windowName, "SiC8051F") != nullptr;
+                if (isDialogAtom || isDialogName || isSiLabsTitle) {
+                    LOG("[SUPPRESS] DLL dialog creation intercepted (title=%s)\n", windowName ? windowName : "");
+                    style &= ~WS_VISIBLE;
+                }
+                return s_realCreateWindowExA
+                    ? s_realCreateWindowExA(exStyle, className, windowName, style, x, y, w, h, parent, menu, inst, param)
+                    : nullptr;
+            }
+        };
+        if (HookImportByName(static_cast<HMODULE>(g_agdi.Module()), "USER32.dll", "CreateWindowExA",
+                             reinterpret_cast<void*>(&CW::Stub), reinterpret_cast<void**>(&s_realCreateWindowExA))) {
+            LOGV("[PATCH] CreateWindowExA IAT hooked by name\n");
         }
     }
+
+    ClearLastDllError();
 
     LOG("[CONN] Connecting to target...\n");
     ret = CallInitFeatures(g_agdi, &m_features);
     if (ret == (U32)-1) {
+        SetLastDllError("SiC8051F: INITFEATURES crashed (access violation)");
         LOG("[ERROR] INITFEATURES crashed (access violation — check DLL state)\n");
+        if (g_agdi.AG_Init) {
+            g_agdi.AG_Init(AGDI_UNINIT, nullptr);
+        }
+        g_agdi.Unload();
+        g_agdi.Load();
         return false;
     }
     LOGV("RunControl: INITFEATURES returned %u\n", ret);
     if (ret != 0) {
+        if (LastDllError().empty()) {
+            SetLastDllError("SiC8051F: Target failed to respond. System is being disconnected.");
+        }
         LOG("[ERROR] Target not connected (INITFEATURES=%u) — check EC3 debug connector\n", ret);
-        g_agdi.AG_Init(AGDI_UNINIT, nullptr);
+        if (g_agdi.AG_Init) {
+            g_agdi.AG_Init(AGDI_UNINIT, nullptr);
+        }
+        m_sessionActive = false;
+        m_isFlashOnly   = false;
+        g_agdi.Unload();
+        if (g_agdi.Load()) {
+            LOG("[AGDI] DLL reloaded after connect failure\n");
+        } else {
+            LOG("[ERROR] DLL reload failed after connect failure\n");
+        }
         return false;
     }
     LOG("[CONN] Target connected OK\n");
@@ -627,11 +819,15 @@ void RunControl::UninitAgdiSession()
 bool RunControl::Init()
 {
     m_haltEvent = CreateEventA(nullptr, /*manualReset=*/TRUE, /*initial=*/FALSE, nullptr);
+    if (m_haltEvent) {
+        StartPopupWatcher();
+    }
     return m_haltEvent != nullptr;
 }
 
 void RunControl::Shutdown()
 {
+    StopPopupWatcher();
     UninitAgdiSession();
     g_agdi.Unload();
 
@@ -786,6 +982,87 @@ void RunControl::ReadRegisters()
     g_registers.Update(regs);
     LOG("[REGS] FINAL: PC=0x%04X SP=0x%02X ACC=0x%02X PSW=0x%02X B=0x%02X DPH:DPL=%02X:%02X\n",
         regs.nPC, regs.sp, regs.acc, regs.psw, regs.b, regs.dph, regs.dpl);
+}
+
+void RunControl::ReadPcSp()
+{
+    if (!g_agdi.AG_RegAcc) return;
+
+    // Refresh DLL state (required before register reads).
+    if (g_agdi.AG_AllReg) {
+        g_agdi.AG_AllReg(AG_READ, nullptr);
+    }
+
+    // PC via AG_RegAcc (mPC = 0x500)
+    GVAL val{};
+    g_agdi.AG_RegAcc(AG_READ, 0x500, &val);
+    uint32_t pc = val.u32 & 0xFFFF;
+
+    // SP via AG_MemAcc (DATA:0x81)
+    uint8_t sp = 0;
+    if (g_agdi.AG_MemAcc) {
+        UC8 rdBuf[4] = {};
+        GADR addr{};
+        addr.mSpace = amDATA;
+        addr.Adr = (static_cast<UL32>(amDATA) << 24) | 0x81;
+        g_agdi.AG_MemAcc(AG_READ, rdBuf, &addr, 1);
+        sp = rdBuf[0];
+    }
+
+    g_registers.UpdatePcSp(pc, sp);
+}
+
+void RunControl::ReadPc()
+{
+    if (!g_agdi.AG_RegAcc) return;
+
+    if (g_agdi.AG_AllReg) {
+        g_agdi.AG_AllReg(AG_READ, nullptr);
+    }
+
+    GVAL val{};
+    g_agdi.AG_RegAcc(AG_READ, 0x500, &val);
+    uint32_t pc = val.u32 & 0xFFFF;
+
+    g_registers.UpdatePcSp(pc, g_registers.SP());  // keep cached SP
+}
+
+void RunControl::ReadPcSpCached()
+{
+    if (!g_agdi.AG_RegAcc) return;
+
+    // Skip AG_AllReg — GoStep already refreshed the DLL's internal cache
+    // from hardware (FUN_10005060).  AG_RegAcc reads PC from that cache
+    // (0 USB).  SP must come from AG_MemAcc (1 USB) since AG_RegAcc
+    // returns 0 for SFR register IDs.
+    GVAL val{};
+    g_agdi.AG_RegAcc(AG_READ, 0x500, &val);
+    uint32_t pc = val.u32 & 0xFFFF;
+
+    uint8_t sp = 0;
+    if (g_agdi.AG_MemAcc) {
+        UC8 rdBuf[4] = {};
+        GADR addr{};
+        addr.mSpace = amDATA;
+        addr.Adr = (static_cast<UL32>(amDATA) << 24) | 0x81;
+        g_agdi.AG_MemAcc(AG_READ, rdBuf, &addr, 1);
+        sp = rdBuf[0];
+    }
+
+    g_registers.UpdatePcSp(pc, sp);
+}
+
+void RunControl::ReadPcCached()
+{
+    if (!g_agdi.AG_RegAcc) return;
+
+    // Fastest post-GoStep read: PC only from DLL cache (0 USB calls).
+    // GoStep already refreshed the cache via FUN_10005060.
+    GVAL val{};
+    g_agdi.AG_RegAcc(AG_READ, 0x500, &val);
+    uint32_t pc = val.u32 & 0xFFFF;
+
+    g_registers.UpdatePcSp(pc, g_registers.SP());  // keep cached SP
 }
 
 void RunControl::SaveRegDsc(const RegDsc* rd)

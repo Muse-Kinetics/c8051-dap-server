@@ -30,6 +30,9 @@ public:
     // Update from an RG51 struct (called from the AGDI callback — thread-safe).
     void Update(const RG51& regs);
 
+    // Partial update — only PC and SP (for lightweight step-loop reads).
+    void UpdatePcSp(uint32_t pc, uint8_t sp);
+
     // Current program counter.
     uint32_t PC() const;
 

@@ -1,7 +1,7 @@
 # DAP Implementation Status
 
-**Last updated:** April 16, 2026  
-**Server version:** v0.10.0  
+**Last updated:** April 18, 2026  
+**Server version:** v0.11.0  
 **Reference:** Microsoft vscode-mock-debug (`dap_ref/vscode-mock-debug/`)
 
 ---
@@ -24,11 +24,11 @@ and the mock-debug reference implementation.
 | `setExceptionBreakpoints` | `HandleSetExceptionBreakpoints` | No | Returns `success:true` with empty body |
 | `threads` | `HandleThreads` | No | Always returns 1 thread: `C8051F380` |
 | `continue` | `HandleContinue` | Yes (`breakpoint`, async) | WDT disable → `AG_GOFORBRK` → halt via HWND PostMessage |
-| `next` | `HandleNext` | Yes (`step`, async) | Reads opcode at PC; detects LCALL/ACALL → temp BP at return addr + `AG_GOFORBRK`; otherwise `AG_GOTILADR` |
-| `stepIn` | `HandleStepIn` | Yes (`step`, async) | `AG_NSTEP` single instruction |
-| `stepOut` | `HandleStepOut` | Yes (`step`, async) | Reads return address from stack (PCH/PCL), sets temp BP, runs `AG_GOFORBRK` |
+| `next` | `HandleNext` | Yes (`step`, async) | Source-level loop: single-steps until source line changes; SP-growth detection places temp BP at return address for CALL step-over; `stepGranularity=instruction` early-returns with one `AG_NSTEP` |
+| `stepIn` | `HandleStepIn` | Yes (`step`, async) | `AG_NSTEP` single instruction; `stepGranularity=instruction` supported |
+| `stepOut` | `HandleStepOut` | Yes (`step`, async) | Source-level single-step loop until SP decreases; `stepGranularity=instruction` supported |
 | `pause` | `HandlePause` | Yes (`pause`, async) | `AG_STOPRUN` → halt detection |
-| `stackTrace` | `HandleStackTrace` | No | Single frame; uses symtab for name/source/line |
+| `stackTrace` | `HandleStackTrace` | No | Physical 8051 stack unwinder (reads SP, DATA stack bytes, resolves return addresses via symtab) + logical frame cache that preserves callers lost to Keil tail-call optimisation; `CallsFunction`/`FindCallPath` source-scan fallback fills missing intermediate frames |
 | `scopes` | `HandleScopes` | No | 6 scopes: Locals (conditional), Registers, CODE, XDATA, DATA, IDATA |
 | `variables` | `HandleVariables` | No | Locals from m51 PROC info; Registers from RG51; memory from `AG_MemAcc` (256 bytes per scope) |
 | `readMemory` | `HandleReadMemory` | No | Encoded `mSpace<<24 \| addr`; base64 response |
@@ -69,6 +69,7 @@ From `MakeCapabilities()` in `dap_types.h`:
 | `supportsDisconnectRequest` | `true` | |
 | `supportsReadMemoryRequest` | `true` | |
 | `supportsEvaluateForHovers` | `true` | Local vars, SFRs, registers, symbols |
+| `supportsSteppingGranularity` | `true` | `statement` (source-line loop) or `instruction` (single opcode) |
 | `supportsTerminateRequest` | `false` | Aliased internally to disconnect |
 | `supportsRestartRequest` | `false` | |
 
@@ -77,6 +78,8 @@ From `MakeCapabilities()` in `dap_types.h`:
 | Capability | Why |
 |---|---|
 | `supportsValueFormattingOptions` | `true` — we already format hex; could support decimal toggle |
+| `supportsSetVariable` | Enable editing variables/registers from the Variables panel |
+| `supportsSetExpression` | Enable editing watch expressions |
 
 ### Capabilities We Don't Need (mock-debug has, we skip)
 
@@ -88,7 +91,7 @@ From `MakeCapabilities()` in `dap_types.h`:
 | `supportsBreakpointLocationsRequest` | No line-level granularity yet |
 | `supportsStepInTargetsRequest` | No call analysis |
 | `supportsExceptionFilterOptions` | No exception model on 8051 bare-metal |
-| `supportsSetVariable` / `supportsSetExpression` | Not implemented yet |
+| `supportsSetVariable` / `supportsSetExpression` | Not yet — planned |
 | `supportsDisassembleRequest` | Not implemented yet |
 | `supportsInstructionBreakpoints` | Not implemented yet |
 
@@ -143,13 +146,9 @@ From `MakeCapabilities()` in `dap_types.h`:
 ### BUG-1: Pause Button Does Not Work
 
 **Severity:** Medium  
-**Status:** Open — needs investigation.  
+**Status:** Open — not yet investigated in Phase 10.  
 **Symptom:** After continue, clicking the VS Code pause button has no visible effect.
 The server log shows no `[DAP] -> pause` request arriving.
-
-**Analysis:**
-The server code for `HandlePause` is correct: it calls `AG_GoStep(AG_STOPRUN)`.
-But the `pause` request never arrives over TCP.
 
 **Likely cause:** VS Code may not transition the toolbar to "running" state correctly,
 so the pause button is not shown or enabled.
@@ -193,11 +192,39 @@ display both 8-bit and 16-bit interpretations.
 
 ---
 
+### BUG-6: Step-Driven Path Loses Intermediate Call Stack Frames
+
+**Severity:** Medium  
+**Status:** Resolved (all tested paths verified).  
+**Symptom:** When stepping into a deeply nested call without first hitting a breakpoint,
+the physical 8051 stack unwind showed only 2 frames instead of the expected 4–5.
+
+**Root cause:** Keil C51 generates inline or tail-call sequences; intermediate return
+addresses are never pushed onto the hardware stack.
+
+**Resolution:** Logical frame cache with selective eviction (only evicts when the top
+function changes, not on stack shrink). `CallsFunction()` + `FindCallPath()` source-scan
+fallback fills missing intermediate frames. Verified across all tested step paths:
+- Breakpoint-driven: `usb_midi_stall_check → midi_serve_usb → MidiServe → main` (4 frames) ✓
+- Step-out: no stale frames ✓
+- Direct step-in (inlined path): `usb_midi_stall_check → MidiServe → main` (3 frames) ✓
+- Multiple continue cycles: consistent ✓
+
+---
+
 ### Resolved Bugs
 
 | Bug | Description | Resolution |
 |-----|-------------|------------|
 | BUG-2 | OMF-51 line parsing returns 0 entries | **Resolved** — switched to m51 LINE# parsing; 8051 line-level source mapping now works |
+| BUG-3 | Function entry stops on comment/declaration line | **Resolved** — `LookupLine` now prefers the first executable line for function-entry PCs |
+| BUG-6 | Step-driven call stack loses intermediate frames | **Resolved** — logical frame cache with selective eviction + `FindCallPath` source-scan fallback; all tested paths verified |
+| BUG-7 | Native SiC8051F DLL popup escaping suppression | **Resolved** — in-process IAT hooks for `MessageBoxA`, `ShowWindow`, `CreateWindowExA`; `ShowDialog` entry patched to RET; background watcher thread auto-closes surviving windows |
+| BUG-8 | VS Code blocking modal on launch failure | **Resolved** — launch failure now sends non-blocking `output` event + `terminated`/`exited` events instead of a DAP error response that triggered VS Code's modal dialog |
+| BUG-9 | Build date in splash banner not updated on incremental builds | **Resolved** — `touch_main` CMake custom target always touches `main.cpp` before compile so `__DATE__`/`__TIME__` reflect each build |
+| BUG-10 | Step-over skips consecutive CALL lines | **Resolved** — after returning from a CALL via breakpoint, the code now falls through to the line check instead of `continue`-ing; fixes `MidiServe(); USB_Handler();` being collapsed into a single step |
+| BUG-11 | Assembly modules never loaded (`?C_STARTUP` etc.) | **Resolved** — `ParseM51` now special-cases `?C_XXXX` names: strips prefix, appends `.A51`, resolves via recursive file search |
+| BUG-12 | PC=0x0000 shows no source on cold halt | **Resolved** — synthetic LINE# entry injected at 0x0000 → `STARTUP.A51` label line after sort; cold halt now opens `STARTUP.A51:230` |
 | BUG-3 | Step halt detection timeout | **Resolved** — triple-path halt detection (RUNSTOP + MSGSTRING + PostMessage) |
 | — | AG_MemAcc stack corruption | **Resolved** — DLL writes past requested byte count; all single-byte reads now use 4-byte padded buffers |
 | — | Step-over infinite loop | **Resolved** — HandleNext detects LCALL/ACALL opcodes and sets temp breakpoints instead of single-stepping through called functions |
@@ -211,40 +238,39 @@ display both 8-bit and 16-bit interpretations.
 
 ## 6. TODO List (Priority Order)
 
-### Critical (Blocking Basic Debug)
-
-- [ ] **Diagnose pause failure** — Follow diagnostic steps in BUG-1 above. Determine
-      if VS Code sends the `pause` request at all.
-- [ ] **Handle `setExceptionBreakpoints`** — Return `success:true` with empty
-      `breakpoints` array. VS Code sends this during init; returning an error may
-      cause subtle state issues.
-- [ ] **Fix OMF-51 line parser** — Rewrite `ParseOmfAbs()` to parse individual `.obj`
-      files for line number records. This unblocks source-level stepping and source
-      breakpoints.
-
 ### High (Core Debug Quality)
 
-- [ ] **Add `breakpoints` contribution to extension `package.json`** — Without this,
-      VS Code doesn't show the BP gutter for C/ASM files.
+- [ ] **Improve stepping speed** — Source-level step-over is sluggish due to per-instruction
+      USB round-trips (each `AG_NSTEP` + `ReadPcSpCached` costs one or more USB transfers).
+      Investigate: batching, longer `AG_GOTILADR` runs to next source boundary, or querying
+      DLL instruction length to skip inner steps entirely.
+- [ ] **Fix watch variable resolution failures** — Adding local or global variable names to
+      the Watch panel sometimes fails to resolve (returns error or empty). Investigate whether
+      the `evaluate` handler lookup order (locals → SFRs → registers → PUBLIC symbols) drops
+      valid names, and whether variables in registers (not RAM) need a different lookup path.
+- [ ] **Restore locals in Variables panel** — Local variables were removed from the `variables`
+      handler during debugging. Re-enable with correct address resolution; verify against `.lst`
+      file to ensure m51 SYMBOL addresses match actual linker assignments. Handle register-resident
+      variables and 16-bit `int` reads.
+- [ ] **Verify and implement `setVariable`** — Test whether VS Code sends `setVariable` for
+      watch expressions and locals edits. Implement using `AG_RegAcc` (registers) and
+      `AG_MemAcc(AG_WRITE)` (memory). Also implement `setExpression` for watch edits.
+- [ ] **Diagnose pause failure** — Follow diagnostic steps in BUG-1 above. Determine
+      if VS Code sends the `pause` request at all.
 - [ ] **Fix WaitAndSendStopped race** — When a new run-control command is issued
       while a previous `WaitAndSendStopped` thread is active, the old thread should
       be cancelled to prevent duplicate `stopped` events.
-- [ ] **Add `stepOut` handler** — Read return address from stack (`SP` register
-      points to top of IDATA stack; return address is 2 bytes below on 8051), use
-      `AG_GOTILADR` to run to that address.
-- [ ] **Verify `AG_STOPRUN` works** — The `HandlePause` code calls
-      `AG_GoStep(AG_STOPRUN, 0, nullptr)`. This needs HW verification that the DLL
-      accepts it and halts the target.
 
 ### Medium (Feature Improvements)
 
+- [ ] **Add custom memory panels to debug sidebar** — Add collapsible sections below
+      Breakpoints for memory space views: `DATA` (0x00–0xFF internal RAM), `IDATA`
+      (0x80–0xFF indirect), `XDATA` (external RAM). Each should show user-defined address
+      ranges. Implement via `scopes`/`variables` (new named scopes) or `readMemory` with
+      a custom VS Code contribution panel. Allow user to define named regions in `launch.json`.
 - [ ] **Multi-byte variable display** — Keil C51 `int` is 16-bit; `long` is 32-bit.
       Currently all locals/watch values are read as single bytes. Need type info from
       `.lst` or `.obj` files, or a simple heuristic (read 2 bytes for `int`).
-- [ ] **Investigate locals showing 0x00** — Locals panel shows all zeros. May be an
-      address mapping issue or the variables may live in registers, not RAM.
-- [ ] **Add `setVariable` handler** — Allow editing registers and memory from the
-      Variables panel via `AG_RegAcc` and `AG_MemAcc(AG_WRITE)`.
 - [ ] **Add `disassemble` handler** — Use the `opcodes8051.h` instruction length
       table + a basic 8051 disassembler to return `DisassembledInstruction` objects.
 - [ ] **Add `writeMemory` handler** — Mirror `readMemory` but with `AG_MemAcc(AG_WRITE)`.

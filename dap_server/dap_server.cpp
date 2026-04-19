@@ -43,6 +43,19 @@ DapServer* g_pServer = nullptr;
 // stopped event must NOT be sent (a newer command owns the halt).
 static std::atomic<uint32_t> g_runGeneration{0};
 
+// Cached logical call stack for the most recent stop. This lets us preserve
+// tail-called/sibling-called frames that do not exist as a physical return
+// address on the 8051 stack.
+static std::vector<nlohmann::json> g_cachedLogicalFrames;
+static uint32_t g_cachedStackPc = 0xFFFFFFFFu;
+static uint8_t  g_cachedStackSp = 0xFFu;
+
+// Return the byte length of an 8051 instruction given its opcode.
+static inline uint8_t Opcode8051Length(uint8_t opcode)
+{
+    return k8051InstructionLength[opcode];
+}
+
 // ---------------------------------------------------------------------------
 // Construction / destruction
 // ---------------------------------------------------------------------------
@@ -433,6 +446,9 @@ void DapServer::HandleDisconnect(int seq, const nlohmann::json& /*args*/)
     }
     g_hexLoader.Unload();
     g_symtab.Clear();
+    g_cachedLogicalFrames.clear();
+    g_cachedStackPc = 0xFFFFFFFFu;
+    g_cachedStackSp = 0xFFu;
 
     SendResponse(seq, "disconnect");
     m_disconnecting = true;
@@ -444,9 +460,22 @@ void DapServer::HandleDisconnect(int seq, const nlohmann::json& /*args*/)
 
 void DapServer::HandleLaunch(int seq, const nlohmann::json& args)
 {
+    auto sendNonBlockingLaunchFailure = [&](const std::string& reason) {
+        SendEvent("output", {
+            {"category", "console"},
+            {"output",   std::string("[launch failed] ") + reason + "\n"},
+        });
+        SendResponse(seq, "launch");
+        SendEvent("terminated", {
+            {"restart", false}
+        });
+        SendEvent("exited", {
+            {"exitCode", 1}
+        });
+    };
+
     if (!args.contains("program") || !args["program"].is_string()) {
-        SendResponse(seq, "launch", nlohmann::json(nullptr),
-                     false, "launch requires 'program' (path to HEX file)");
+        sendNonBlockingLaunchFailure("launch requires 'program' (path to HEX file)");
         return;
     }
 
@@ -468,8 +497,7 @@ void DapServer::HandleLaunch(int seq, const nlohmann::json& args)
 
     if (!g_hexLoader.LoadFile(hexPath)) {
         LOG("[ERROR] Could not parse HEX file: %s\n", hexPath.c_str());
-        SendResponse(seq, "launch", nlohmann::json(nullptr),
-                     false, "could not parse HEX file: " + hexPath);
+        sendNonBlockingLaunchFailure("could not parse HEX file: " + hexPath);
         return;
     }
     LOG("[HEX]  Loaded %u bytes at base 0x%04X\n",
@@ -482,9 +510,12 @@ void DapServer::HandleLaunch(int seq, const nlohmann::json& args)
 
     // Run the AGDI registration chain.
     if (!g_runControl.InitAgdiSession(isFlash, noErase)) {
-        LOG("[ERROR] AGDI session init failed\n");
-        SendResponse(seq, "launch", nlohmann::json(nullptr),
-                     false, "AGDI registration chain failed — target not connected?");
+        std::string dllErr = g_runControl.LastDllError();
+        std::string errMsg = dllErr.empty()
+            ? "AGDI registration chain failed — target not connected? Run scripts/reset_silabs.ps1 and retry."
+            : (dllErr + " Run scripts/reset_silabs.ps1 and retry.");
+        LOG("[ERROR] AGDI session init failed: %s\n", errMsg.c_str());
+        sendNonBlockingLaunchFailure(errMsg);
         return;
     }
 
@@ -685,18 +716,27 @@ void DapServer::HandleContinue(int seq, const nlohmann::json& /*args*/)
     std::thread(WaitAndSendStopped, kStopReasonBreakpoint, gen).detach();
 }
 
-void DapServer::HandleNext(int seq, const nlohmann::json& /*args*/)
+void DapServer::HandleNext(int seq, const nlohmann::json& args)
 {
     SendResponse(seq, "next");
 
-    // Source-level step over:
-    // Step instructions in a loop until the source line changes.
-    // When the current instruction is a CALL (LCALL/ACALL), set a temporary
-    // breakpoint at the return address and run instead of single-stepping
-    // through the entire called function.
-    // When we detect SP > startSP (inside a called function, e.g. due to
-    // hitting a user breakpoint inside the call), use a temp BP at the
-    // stack return address to quickly step out.
+    // Instruction granularity: one opcode, no source-line loop.
+    if (args.value("granularity", "statement") == "instruction") {
+        if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
+            g_runControl.ReadPcSpCached();
+            uint32_t gen = ++g_runGeneration;
+            std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
+        }
+        return;
+    }
+
+    // Source-level step over: single-step instructions until the source line
+    // changes, stepping over CALLs by detecting SP growth and running to the
+    // return address.
+    //
+    // After each GoStep(NSTEP,1), the DLL refreshes its internal register
+    // cache from hardware before returning.  ReadPcSpCached() reads PC from
+    // that cache and SP via AG_MemAcc (1 USB call per iteration vs 3).
     uint32_t startPC = g_registers.PC();
     auto startLoc = g_symtab.LookupLine(startPC);
 
@@ -704,14 +744,16 @@ void DapServer::HandleNext(int seq, const nlohmann::json& /*args*/)
         uint8_t startSP = g_registers.SP();
 
         for (int i = 0; i < 50000; ++i) {
-            uint32_t pc = g_registers.PC();
-            uint8_t  sp = g_registers.SP();
+            g_runControl.GoStep(AG_NSTEP, 1, nullptr);
+            g_runControl.ReadPcSpCached();
 
-            // If we're inside a called function (SP grew), step out quickly
-            // by setting a temp BP at the return address on the stack.
+            uint32_t pc = g_registers.PC();
+            uint8_t  sp = g_registers.SP();  // cached — not re-read
+
+            // If SP grew, we entered a CALL.  Step out to the return address
+            // so we get step-over semantics.
             if (sp > startSP) {
-                // 8051 LCALL stack layout: [SP]=PCH, [SP-1]=PCL
-                // Use 4-byte buffers — DLL may overwrite past requested count.
+                // Read return address from 8051 stack: [SP]=PCH, [SP-1]=PCL
                 UC8 pclBuf[4] = {}, pchBuf[4] = {};
                 GADR stkAddr{};
                 stkAddr.mSpace = amDATA;
@@ -726,55 +768,24 @@ void DapServer::HandleNext(int seq, const nlohmann::json& /*args*/)
                 g_runControl.RequestRun();
                 g_runControl.WaitForHalt(30000);
                 g_bpManager.RemoveTempBreakpoint(tempBP);
-                // Registers already read by WM_USER+3 handler.
-                continue;
+                g_runControl.ReadPcSpCached();
+                pc = g_registers.PC();
+                sp = g_registers.SP();
+                // Fall through to line check — do NOT re-step immediately.
+                // Without this, consecutive CALLs on different source lines
+                // (e.g. MidiServe(); USB_Handler();) would both be stepped over
+                // before the loop stops.
             }
 
-            // Read the opcode at the current PC from CODE space.
-            // Use 4-byte buffer — DLL may overwrite past requested count.
-            UC8 opBuf[4] = {};
-            if (g_agdi.AG_MemAcc) {
-                GADR codeAddr{};
-                codeAddr.mSpace = amCODE;
-                codeAddr.Adr = (static_cast<UL32>(amCODE) << 24) | (pc & 0xFFFF);
-                g_agdi.AG_MemAcc(AG_READ, opBuf, &codeAddr, 1);
-            }
-            UC8 opcode = opBuf[0];
-
-            // Detect CALL instructions:
-            //   LCALL addr16 = 0x12 (3 bytes)
-            //   ACALL addr11 = xxx1_0001 pattern (2 bytes)
-            bool isCall = (opcode == 0x12) || ((opcode & 0x1F) == 0x11);
-
-            if (isCall) {
-                // Step over the CALL: set temp BP at the instruction after it.
-                uint32_t nextPC = pc + ((opcode == 0x12) ? 3 : 2);
-                AG_BP* tempBP = g_bpManager.AddTempBreakpoint(nextPC, amCODE);
-                g_runControl.ResetHaltEvent();
-                g_runControl.RequestRun();
-                g_runControl.WaitForHalt(30000);
-                g_bpManager.RemoveTempBreakpoint(tempBP);
-                // Registers already read by WM_USER+3 handler.
-            } else {
-                // Normal single instruction step.
-                g_runControl.GoStep(AG_NSTEP, 1, nullptr);
-                g_runControl.WaitForHalt(5000);
-                g_runControl.ReadRegisters();
-            }
-
-            pc = g_registers.PC();
-
+            // Check if we've moved to a different source line.
             auto loc = g_symtab.LookupLine(pc);
-            if (!loc)
-                continue;
-            // Same line — keep stepping.
+            if (!loc) continue;
             if (loc->file == startLoc->file && loc->line == startLoc->line)
                 continue;
-            // Different source line — done.
-            break;
+            break;  // reached a new source line
         }
 
-        // Already halted and registers read — send stopped event directly.
+        g_runControl.ReadPcSpCached();
         uint32_t pc = g_registers.PC();
         LOG("[DEBUG] Source step-over complete at PC=0x%04X\n", pc);
         SendEvent("stopped", {
@@ -785,27 +796,42 @@ void DapServer::HandleNext(int seq, const nlohmann::json& /*args*/)
     } else {
         // No source info — fall back to single instruction step.
         if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
-            g_runControl.ReadRegisters();  // safe: GoStep already returned
+            g_runControl.ReadPcSpCached();
             uint32_t gen = ++g_runGeneration;
             std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
         }
     }
 }
 
-void DapServer::HandleStepIn(int seq, const nlohmann::json& /*args*/)
+void DapServer::HandleStepIn(int seq, const nlohmann::json& args)
 {
     SendResponse(seq, "stepIn");
 
-    // Source-level step in: step instructions until the source line changes.
-    // Unlike step-over, we do NOT check SP — we follow into calls.
+    // Instruction granularity: one opcode, no source-line loop.
+    if (args.value("granularity", "statement") == "instruction") {
+        if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
+            g_runControl.ReadPcSpCached();
+            uint32_t gen = ++g_runGeneration;
+            std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
+        }
+        return;
+    }
+
+    // Source-level step in: single-step instructions until the source line
+    // changes.  Unlike step-over, we do NOT skip CALLs — stepping into a
+    // CALL means the next instruction is inside the called function, which
+    // will map to a different source line and naturally stop us.
+    //
+    // ReadPcCached() reads only PC from the DLL's already-refreshed
+    // register cache — zero USB overhead per iteration.  Step-in does
+    // not need SP (no CALL detection).
     uint32_t startPC = g_registers.PC();
     auto startLoc = g_symtab.LookupLine(startPC);
 
     if (startLoc && g_symtab.IsLoaded()) {
         for (int i = 0; i < 50000; ++i) {
             g_runControl.GoStep(AG_NSTEP, 1, nullptr);
-            g_runControl.WaitForHalt(5000);
-            g_runControl.ReadRegisters();
+            g_runControl.ReadPcCached();
 
             uint32_t pc = g_registers.PC();
             auto loc = g_symtab.LookupLine(pc);
@@ -816,6 +842,7 @@ void DapServer::HandleStepIn(int seq, const nlohmann::json& /*args*/)
             break;
         }
 
+        g_runControl.ReadPcSpCached();
         uint32_t pc = g_registers.PC();
         LOG("[DEBUG] Source step-in complete at PC=0x%04X\n", pc);
         SendEvent("stopped", {
@@ -826,54 +853,81 @@ void DapServer::HandleStepIn(int seq, const nlohmann::json& /*args*/)
     } else {
         // No source info — single instruction step.
         if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
-            g_runControl.ReadRegisters();  // safe: GoStep already returned
+            g_runControl.ReadPcSpCached();
             uint32_t gen = ++g_runGeneration;
             std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
         }
     }
 }
 
-void DapServer::HandleStepOut(int seq, const nlohmann::json& /*args*/)
+void DapServer::HandleStepOut(int seq, const nlohmann::json& args)
 {
     SendResponse(seq, "stepOut");
 
-    // Step out: read the return address from the 8051 stack and run until we
-    // reach it.  On 8051, LCALL/ACALL push PCL first then PCH:
-    //   SP+1 → store PCL, SP+1 → store PCH
-    // After LCALL: [SP] = PCH (high byte), [SP-1] = PCL (low byte)
-    uint8_t sp = g_registers.SP();
-
-    if (sp >= 2 && g_agdi.AG_MemAcc) {
-        // Use 4-byte buffers — DLL may overwrite past requested count.
-        UC8 pclBuf[4] = {}, pchBuf[4] = {};
-        GADR addr{};
-        addr.mSpace = amDATA;
-
-        // Read PCH at [SP] (pushed last = top of stack)
-        addr.Adr = (static_cast<UL32>(amDATA) << 24) | sp;
-        g_agdi.AG_MemAcc(AG_READ, pchBuf, &addr, 1);
-
-        // Read PCL at [SP-1] (pushed first)
-        addr.Adr = (static_cast<UL32>(amDATA) << 24) | (sp - 1);
-        g_agdi.AG_MemAcc(AG_READ, pclBuf, &addr, 1);
-
-        uint32_t retAddr = (static_cast<uint32_t>(pchBuf[0]) << 8) | pclBuf[0];
-        LOG("[DEBUG] Step out: SP=0x%02X, return address=0x%04X\n", sp, retAddr);
-
-        GADR target{};
-        target.Adr    = retAddr & 0xFFFF;
-        target.mSpace = amCODE;
-
-        if (g_runControl.GoStep(AG_GOTILADR, 0, &target)) {
-            g_runControl.ReadRegisters();  // safe: GoStep already returned
+    // Instruction granularity: one opcode.
+    if (args.value("granularity", "statement") == "instruction") {
+        if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
+            g_runControl.ReadPcSpCached();
             uint32_t gen = ++g_runGeneration;
             std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
         }
+        return;
+    }
+
+    // Source-level step out: single-step until the current frame really
+    // returns. This is slower than a run-to-address shortcut, but it is much
+    // more reliable on the SiLabs 8051 target where AG_GOTILADR can skip to a
+    // deeper breakpoint or miss the immediate caller.
+    uint32_t startPC = g_registers.PC();
+    uint8_t  startSP = g_registers.SP();
+    auto startLoc = g_symtab.LookupLine(startPC);
+    std::string currentFunction = g_symtab.LookupSymbol(startPC);
+    std::string expectedCaller;
+    if (g_cachedLogicalFrames.size() >= 2) {
+        expectedCaller = g_cachedLogicalFrames[1].value("name", "");
+    }
+
+    if (startLoc && g_symtab.IsLoaded()) {
+        for (int i = 0; i < 50000; ++i) {
+            g_runControl.GoStep(AG_NSTEP, 1, nullptr);
+            g_runControl.ReadPcSpCached();
+
+            uint32_t pc = g_registers.PC();
+            uint8_t  sp = g_registers.SP();
+            auto loc = g_symtab.LookupLine(pc);
+            std::string func = g_symtab.LookupSymbol(pc);
+
+            bool returnedToCaller = false;
+            bool stackPoppedReturn = (sp + 2 <= startSP);
+            if (!expectedCaller.empty() && func == expectedCaller && stackPoppedReturn) {
+                returnedToCaller = true;
+            } else if (!currentFunction.empty() && func != currentFunction && stackPoppedReturn) {
+                returnedToCaller = true;
+            } else if (stackPoppedReturn) {
+                returnedToCaller = true;
+            }
+
+            if (!returnedToCaller)
+                continue;
+            if (!loc)
+                break;
+            if (loc->file == startLoc->file && loc->line == startLoc->line)
+                continue;
+            break;
+        }
+
+        g_runControl.ReadPcSpCached();
+        uint32_t pc = g_registers.PC();
+        LOG("[DEBUG] Source step-out complete at PC=0x%04X\n", pc);
+        SendEvent("stopped", {
+            {"reason",            kStopReasonStep},
+            {"threadId",          kThreadId},
+            {"allThreadsStopped", true},
+        });
     } else {
-        LOG("[DEBUG] Step out: SP too low (%d) or no AG_MemAcc\n", sp);
-        // Fall back to single step.
+        LOG("[DEBUG] Step out: no source info available, falling back to single step\n");
         if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
-            g_runControl.ReadRegisters();  // safe: GoStep already returned
+            g_runControl.ReadPcSpCached();
             uint32_t gen = ++g_runGeneration;
             std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
         }
@@ -908,13 +962,237 @@ void DapServer::HandlePause(int seq, const nlohmann::json& /*args*/)
     });
 }
 
-void DapServer::HandleStackTrace(int seq, const nlohmann::json& /*args*/)
+void DapServer::HandleStackTrace(int seq, const nlohmann::json& args)
 {
-    // Single frame from the register cache PC.
-    nlohmann::json frame = g_registers.ToStackFrame(1);
+    int startFrame = args.value("startFrame", 0);
+    int levels     = args.value("levels", 20);
+    if (startFrame < 0) startFrame = 0;
+    if (levels <= 0) levels = 20;
+
+    auto BaseName = [](const std::string& path) -> std::string {
+        size_t slash = path.find_last_of("\\/");
+        return (slash == std::string::npos) ? path : path.substr(slash + 1);
+    };
+
+    auto MakeFrame = [&](int frameId, uint32_t pc) -> nlohmann::json {
+        auto loc = g_symtab.LookupLine(pc);
+        std::string sym = g_symtab.LookupSymbol(pc);
+
+        char pcBuf[12];
+        _snprintf_s(pcBuf, sizeof(pcBuf), "0x%04X", pc & 0xFFFF);
+        std::string frameName = sym.empty() ? std::string(pcBuf) : sym;
+
+        if (loc) {
+            return {
+                {"id",     frameId},
+                {"name",   frameName},
+                {"source", {{"name", BaseName(loc->file)}, {"path", loc->file}, {"presentationHint", "normal"}}},
+                {"line",   loc->line},
+                {"column", 1},
+                {"instructionReference", std::string(pcBuf)},
+            };
+        }
+
+        return {
+            {"id",     frameId},
+            {"name",   frameName},
+            {"line",   0},
+            {"column", 0},
+            {"instructionReference", std::string(pcBuf)},
+        };
+    };
+
+    std::vector<nlohmann::json> allFrames;
+    uint32_t currentPc = g_registers.PC();
+    allFrames.push_back(MakeFrame(1, currentPc));
+
+    auto IsAcallOpcode = [](uint8_t op) -> bool {
+        switch (op) {
+        case 0x11: case 0x31: case 0x51: case 0x71:
+        case 0x91: case 0xB1: case 0xD1: case 0xF1:
+            return true;
+        default:
+            return false;
+        }
+    };
+
+    uint8_t sp = g_registers.SP();
+    if (currentPc != 0 && g_agdi.AG_MemAcc && sp > 7) {
+        LOGV("[STACK] unwind start: PC=0x%04X SP=0x%02X\n", currentPc, sp);
+
+        std::vector<UC8> stackBuf(static_cast<size_t>(sp) + 5, 0);
+        GADR addr{};
+        addr.mSpace = amDATA;
+        addr.Adr = (static_cast<UL32>(amDATA) << 24) | 0x00;
+
+        g_agdi.AG_MemAcc(AG_READ, stackBuf.data(), &addr, static_cast<UL32>(sp) + 1);
+
+        // Scan EVERY adjacent byte pair, not just even-aligned ones. The 8051
+        // stack can contain PUSHed registers/temporaries, so the saved return
+        // address is not guaranteed to stay on a 2-byte boundary while stepping.
+        for (int top = static_cast<int>(sp); top >= 2; --top) {
+            uint16_t retAddr = (static_cast<uint16_t>(stackBuf[top]) << 8) | stackBuf[top - 1];
+            if (retAddr < 2 || retAddr == 0xFFFF)
+                continue;
+
+            uint32_t callerPc = 0;
+            bool validCall = false;
+
+            UC8 codeBuf[4] = {};
+            GADR codeAddr{};
+            codeAddr.mSpace = amCODE;
+
+            if (retAddr >= 3) {
+                codeAddr.Adr = (static_cast<UL32>(amCODE) << 24) | ((retAddr - 3) & 0xFFFF);
+                g_agdi.AG_MemAcc(AG_READ, codeBuf, &codeAddr, 3);
+
+                if (codeBuf[0] == 0x12) {
+                    callerPc = static_cast<uint32_t>(retAddr - 3);  // LCALL
+                    validCall = true;
+                } else if (IsAcallOpcode(codeBuf[1])) {
+                    callerPc = static_cast<uint32_t>(retAddr - 2);  // ACALL
+                    validCall = true;
+                }
+            } else {
+                codeAddr.Adr = (static_cast<UL32>(amCODE) << 24) | ((retAddr - 2) & 0xFFFF);
+                g_agdi.AG_MemAcc(AG_READ, codeBuf, &codeAddr, 2);
+                if (IsAcallOpcode(codeBuf[0])) {
+                    callerPc = static_cast<uint32_t>(retAddr - 2);
+                    validCall = true;
+                }
+            }
+
+            if (!validCall)
+                continue;
+
+            auto loc = g_symtab.LookupLine(callerPc);
+            std::string sym = g_symtab.LookupSymbol(callerPc);
+            if (!loc && sym.empty())
+                continue;
+
+            if (allFrames.size() > 1) {
+                std::string prevRef = allFrames.back().value("instructionReference", "");
+                char pcBuf[12];
+                _snprintf_s(pcBuf, sizeof(pcBuf), "0x%04X", callerPc & 0xFFFF);
+                if (prevRef == pcBuf)
+                    continue;
+            }
+
+            LOGV("[STACK] frame %d: callerPC=0x%04X ret=0x%04X stackTop=0x%02X sym=%s\n",
+                 static_cast<int>(allFrames.size()) + 1, callerPc, retAddr, top,
+                 sym.empty() ? "<none>" : sym.c_str());
+
+            allFrames.push_back(MakeFrame(static_cast<int>(allFrames.size()) + 1, callerPc));
+            if (allFrames.size() >= 8)
+                break;
+        }
+    }
+
+    auto FrameKey = [](const nlohmann::json& frame) -> std::string {
+        return frame.value("name", "") + "|" + frame.value("instructionReference", "");
+    };
+    auto FrameName = [](const nlohmann::json& frame) -> std::string {
+        return frame.value("name", "");
+    };
+
+    std::vector<nlohmann::json> logicalFrames = allFrames;
+    if (g_cachedStackPc == currentPc && g_cachedStackSp == sp && !g_cachedLogicalFrames.empty()) {
+        logicalFrames = g_cachedLogicalFrames;
+    } else {
+        // If the new physical stack shares the same caller-chain suffix as the
+        // previous logical stack, keep the missing middle frames. This covers
+        // Keil tail-calls where the callee reuses the caller's return address.
+        if (!g_cachedLogicalFrames.empty() && allFrames.size() >= 2) {
+            size_t i = allFrames.size();
+            size_t j = g_cachedLogicalFrames.size();
+            size_t commonSuffix = 0;
+            while (i > 1 && j > 1 && FrameKey(allFrames[i - 1]) == FrameKey(g_cachedLogicalFrames[j - 1])) {
+                --i;
+                --j;
+                ++commonSuffix;
+            }
+
+            bool topFunctionChanged = FrameName(allFrames[0]) != FrameName(g_cachedLogicalFrames[0]);
+            bool cachedTopCallsNewTop = g_symtab.CallsFunction(FrameName(g_cachedLogicalFrames[0]),
+                                                               FrameName(allFrames[0]));
+            // Only preserve cached frames when the top function changed — this
+            // indicates a step-into-new-function where Keil elided intermediate
+            // return addresses.  Do NOT preserve when the top function is the
+            // same but the stack shrank: that means a genuine return happened
+            // and the deeper frames truly no longer exist.
+            if (topFunctionChanged &&
+                ((commonSuffix >= 2) || (commonSuffix >= 1 && cachedTopCallsNewTop)) &&
+                j > 0) {
+                std::vector<nlohmann::json> merged;
+                merged.push_back(allFrames[0]);
+
+                size_t cachedStart = topFunctionChanged ? 0 : 1;
+                for (size_t k = cachedStart; k < j; ++k) {
+                    if (FrameKey(merged.back()) != FrameKey(g_cachedLogicalFrames[k])) {
+                        merged.push_back(g_cachedLogicalFrames[k]);
+                    }
+                }
+                for (size_t k = 1; k < allFrames.size(); ++k) {
+                    if (FrameKey(merged.back()) != FrameKey(allFrames[k])) {
+                        merged.push_back(allFrames[k]);
+                    }
+                }
+                logicalFrames = std::move(merged);
+                LOGV("[STACK] logical chain preserved: physical=%d logical=%d\n",
+                     (int)allFrames.size(), (int)logicalFrames.size());
+            }
+        }
+
+        // Fallback for sparse physical stacks on Keil/8051: if only a shallow
+        // ancestor survived on the stack, use the static call graph from the
+        // loaded HEX image to restore plausible missing middle frames.
+        if (logicalFrames.size() == allFrames.size() && allFrames.size() >= 2) {
+            std::string topName = FrameName(allFrames[0]);
+            std::string ancestorName = FrameName(allFrames[1]);
+            auto missingPath = g_symtab.FindCallPath(ancestorName, topName, 3);
+            if (!missingPath.empty()) {
+                std::vector<nlohmann::json> augmented;
+                augmented.push_back(allFrames[0]);
+                for (auto itName = missingPath.rbegin(); itName != missingPath.rend(); ++itName) {
+                    auto addr = g_symtab.LookupSymbolByName(*itName);
+                    if (addr) {
+                        auto frame = MakeFrame(static_cast<int>(augmented.size()) + 1, *addr);
+                        if (FrameKey(augmented.back()) != FrameKey(frame)) {
+                            augmented.push_back(frame);
+                        }
+                    }
+                }
+                for (size_t k = 1; k < allFrames.size(); ++k) {
+                    if (FrameKey(augmented.back()) != FrameKey(allFrames[k])) {
+                        augmented.push_back(allFrames[k]);
+                    }
+                }
+                logicalFrames = std::move(augmented);
+                LOGV("[STACK] static call path restored: physical=%d logical=%d\n",
+                     (int)allFrames.size(), (int)logicalFrames.size());
+            }
+        }
+
+        for (size_t idx = 0; idx < logicalFrames.size(); ++idx) {
+            logicalFrames[idx]["id"] = static_cast<int>(idx) + 1;
+        }
+
+        g_cachedLogicalFrames = logicalFrames;
+        g_cachedStackPc = currentPc;
+        g_cachedStackSp = sp;
+    }
+
+    nlohmann::json frames = nlohmann::json::array();
+    int totalFrames = static_cast<int>(logicalFrames.size());
+    if (startFrame > totalFrames) startFrame = totalFrames;
+    int endFrame = ((startFrame + levels) < totalFrames) ? (startFrame + levels) : totalFrames;
+    for (int i = startFrame; i < endFrame; ++i) {
+        frames.push_back(logicalFrames[static_cast<size_t>(i)]);
+    }
+
     nlohmann::json body = {
-        {"stackFrames", {frame}},
-        {"totalFrames", 1}
+        {"stackFrames", frames},
+        {"totalFrames", totalFrames}
     };
     SendResponse(seq, "stackTrace", body);
 }
@@ -931,19 +1209,22 @@ void DapServer::HandleScopes(int seq, const nlohmann::json& args)
     nlohmann::json scopes = nlohmann::json::array();
 
     // Only show Locals scope if we have local variable info for the current PC.
+    // TEMPORARILY DISABLED — VS Code fetches variables even when collapsed,
+    // causing unnecessary AG_MemAcc calls on every step. Re-enable once we
+    // have a lazy-load mechanism.
+#if 0
     if (g_symtab.IsLoaded()) {
         auto locals = g_symtab.LookupLocals(g_registers.PC());
         if (!locals.empty()) {
             scopes.push_back({{"name", "Locals"}, {"presentationHint", "locals"},
-                              {"variablesReference", 99}, {"expensive", false}});
+                              {"variablesReference", 99}, {"expensive", true}});
         }
     }
+#endif
 
-    scopes.push_back({{"name", "Registers"}, {"presentationHint", "registers"}, {"variablesReference", 100}, {"expensive", false}});
-    scopes.push_back({{"name", "CODE"},      {"presentationHint", "registers"}, {"variablesReference", 101}, {"expensive", true}});
-    scopes.push_back({{"name", "XDATA"},     {"presentationHint", "registers"}, {"variablesReference", 102}, {"expensive", true}});
-    scopes.push_back({{"name", "DATA"},      {"presentationHint", "registers"}, {"variablesReference", 103}, {"expensive", true}});
-    scopes.push_back({{"name", "IDATA"},     {"presentationHint", "registers"}, {"variablesReference", 104}, {"expensive", true}});
+    // Registers scope removed — VS Code fetches it even when collapsed,
+    // adding unnecessary overhead on every step.
+    // scopes.push_back({{"name", "Registers"}, {"presentationHint", "registers"}, {"variablesReference", 100}, {"expensive", true}});
 
     SendResponse(seq, "scopes", {{"scopes", scopes}});
 }
@@ -958,13 +1239,26 @@ void DapServer::HandleVariables(int seq, const nlohmann::json& args)
         auto locals = g_symtab.LookupLocals(g_registers.PC());
         nlohmann::json vars = nlohmann::json::array();
         for (const auto& lv : locals) {
+            // Read up to 4 bytes — size inferred from m51 address gaps.
+            // C51 stores multi-byte values big-endian.
+            uint8_t sz = lv.size;
+            if (sz < 1) sz = 1;
+            if (sz > 4) sz = 4;
             UC8 rdBuf[4] = {};
             GADR addr{};
             addr.mSpace = lv.mSpace;
             addr.Adr    = (static_cast<UL32>(lv.mSpace) << 24) | (lv.addr & 0xFFFF);
-            g_agdi.AG_MemAcc(AG_READ, rdBuf, &addr, 1);
-            char valStr[8];
-            _snprintf_s(valStr, sizeof(valStr), "0x%02X", rdBuf[0]);
+            g_agdi.AG_MemAcc(AG_READ, rdBuf, &addr, sz);
+            // Build big-endian hex string with appropriate width.
+            char valStr[12];
+            if (sz == 4)
+                _snprintf_s(valStr, sizeof(valStr), "0x%02X%02X%02X%02X",
+                             rdBuf[0], rdBuf[1], rdBuf[2], rdBuf[3]);
+            else if (sz == 2)
+                _snprintf_s(valStr, sizeof(valStr), "0x%02X%02X",
+                             rdBuf[0], rdBuf[1]);
+            else
+                _snprintf_s(valStr, sizeof(valStr), "0x%02X", rdBuf[0]);
             vars.push_back({
                 {"name",               lv.name},
                 {"value",              valStr},
@@ -1090,9 +1384,8 @@ void DapServer::HandleEvaluate(int seq, const nlohmann::json& args)
     std::string upper;
     for (char c : expr) upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
 
-    // Try 8051 register names.
-    // Read from the register cache (already populated after halt).
-    g_runControl.ReadRegisters();
+    // Register names and locals use the cached values (already populated
+    // after halt / step completion).  No need to re-read from hardware.
 
     struct RegInfo { const char* name; };
     // SFR registers readable via AG_MemAcc from DATA space.
@@ -1179,13 +1472,52 @@ void DapServer::HandleEvaluate(int seq, const nlohmann::json& args)
     if (g_symtab.IsLoaded() && g_agdi.AG_MemAcc) {
         auto lv = g_symtab.LookupLocalByName(expr, g_registers.PC());
         if (lv) {
+            uint8_t sz = lv->size;
+            if (sz < 1) sz = 1;
+            if (sz > 4) sz = 4;
             UC8 rdBuf[4] = {};
             GADR a{};
             a.mSpace = lv->mSpace;
             a.Adr    = (static_cast<UL32>(lv->mSpace) << 24) | (lv->addr & 0xFFFF);
-            g_agdi.AG_MemAcc(AG_READ, rdBuf, &a, 1);
-            char buf[8];
-            _snprintf_s(buf, sizeof(buf), "0x%02X", rdBuf[0]);
+            g_agdi.AG_MemAcc(AG_READ, rdBuf, &a, sz);
+            char buf[12];
+            if (sz == 4)
+                _snprintf_s(buf, sizeof(buf), "0x%02X%02X%02X%02X",
+                             rdBuf[0], rdBuf[1], rdBuf[2], rdBuf[3]);
+            else if (sz == 2)
+                _snprintf_s(buf, sizeof(buf), "0x%02X%02X",
+                             rdBuf[0], rdBuf[1]);
+            else
+                _snprintf_s(buf, sizeof(buf), "0x%02X", rdBuf[0]);
+            SendResponse(seq, "evaluate", {
+                {"result", std::string(buf)},
+                {"variablesReference", 0},
+            });
+            return;
+        }
+    }
+
+    // Try global variable lookup (PUBLIC data symbols from m51).
+    if (g_symtab.IsLoaded() && g_agdi.AG_MemAcc) {
+        auto gv = g_symtab.LookupGlobalByName(expr);
+        if (gv) {
+            uint8_t sz = gv->size;
+            if (sz < 1) sz = 1;
+            if (sz > 4) sz = 4;
+            UC8 rdBuf[4] = {};
+            GADR a{};
+            a.mSpace = gv->mSpace;
+            a.Adr    = (static_cast<UL32>(gv->mSpace) << 24) | (gv->addr & 0xFFFF);
+            g_agdi.AG_MemAcc(AG_READ, rdBuf, &a, sz);
+            char buf[12];
+            if (sz == 4)
+                _snprintf_s(buf, sizeof(buf), "0x%02X%02X%02X%02X",
+                             rdBuf[0], rdBuf[1], rdBuf[2], rdBuf[3]);
+            else if (sz == 2)
+                _snprintf_s(buf, sizeof(buf), "0x%02X%02X",
+                             rdBuf[0], rdBuf[1]);
+            else
+                _snprintf_s(buf, sizeof(buf), "0x%02X", rdBuf[0]);
             SendResponse(seq, "evaluate", {
                 {"result", std::string(buf)},
                 {"variablesReference", 0},

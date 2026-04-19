@@ -15,6 +15,7 @@
 
 #include "symtab.h"
 #include "agdi.h"
+#include "hex_loader.h"
 #include "log.h"
 
 #include <algorithm>
@@ -236,6 +237,42 @@ void SymbolTable::Load(const std::string& hexPath, const std::string& buildRoot)
                   return a.addr < b.addr || (a.addr == b.addr && a.line < b.line);
               });
 
+    // Synthetic LINE# for ?C_STARTUP at 0x0000.
+    // Keil A51 does not emit LINE# records for CSEG AT (absolute) segments,
+    // so the reset vector label has a PUBLIC symbol but no source location.
+    // If ?C_STARTUP is at 0x0000 and there is no LINE# entry there, scan
+    // STARTUP.A51 for the label line and inject a synthetic entry so VS Code
+    // opens the file at the right line on cold-boot halt.
+    {
+        bool hasLineAt0 = !m_lines.empty() && m_lines.front().addr == 0x0000;
+        bool hasSymAt0  = !m_symbols.empty() && m_symbols.front().addr == 0x0000 &&
+                          m_symbols.front().name == "?C_STARTUP";
+        if (hasSymAt0 && !hasLineAt0) {
+            std::string startupPath = ResolveSource("STARTUP.A51", root);
+            if (startupPath != "STARTUP.A51") {
+                // Scan the file for the line that defines the ?C_STARTUP label.
+                std::ifstream sf(startupPath);
+                int lineNo = 0, labelLine = 0;
+                std::string sline;
+                while (std::getline(sf, sline)) {
+                    ++lineNo;
+                    // Match "?C_STARTUP:" at the start of a token (skip comments).
+                    size_t cpos = sline.find(';');
+                    std::string code = (cpos != std::string::npos) ? sline.substr(0, cpos) : sline;
+                    if (code.find("?C_STARTUP:") != std::string::npos) {
+                        labelLine = lineNo;
+                        break;
+                    }
+                }
+                if (labelLine > 0) {
+                    m_lines.insert(m_lines.begin(), {0x0000, startupPath, labelLine});
+                    LOG("[SYM]  synthetic LINE# injected: 0x0000 -> %s:%d\n",
+                        BaseName(startupPath).c_str(), labelLine);
+                }
+            }
+        }
+    }
+
     LOG("[SYM]  Loaded %zu symbols, %zu line entries\n",
         m_symbols.size(), m_lines.size());
 
@@ -253,6 +290,7 @@ void SymbolTable::Clear()
     m_symbols.clear();
     m_lines.clear();
     m_locals.clear();
+    m_globals.clear();
     m_loaded = false;
 }
 
@@ -283,6 +321,7 @@ void SymbolTable::ParseM51(const std::string& m51Path, const std::string& buildR
     int symCount  = 0;
     int lineCount = 0;
     int localCount = 0;
+    int globalCount = 0;
 
     // Current MODULE name — set by "MODULE <name>" lines, used to derive the
     // source filename for LINE# entries.  MODULE names are uppercase versions
@@ -327,9 +366,21 @@ void SymbolTable::ParseM51(const std::string& m51Path, const std::string& buildR
                 currentModule = line.substr(nameStart,
                                             nameEnd == std::string::npos ? std::string::npos
                                                                          : nameEnd - nameStart);
-                // Skip library/runtime modules (e.g., ?C?CLDPTR, ?C_STARTUP).
+                // Most ?-prefixed names are library/runtime stubs with no source.
+                // Exception: Keil assembly modules are named ?C_XXXX where XXXX
+                // is the .A51 file stem (e.g., ?C_STARTUP -> STARTUP.A51).
                 if (!currentModule.empty() && currentModule[0] == '?') {
                     currentFile.clear();
+                    if (currentModule.size() > 3 &&
+                        currentModule[1] == 'C' && currentModule[2] == '_') {
+                        std::string stem = currentModule.substr(3);  // e.g. "STARTUP"
+                        std::string found = ResolveSource(stem + ".A51", buildRoot);
+                        if (found != stem + ".A51") {
+                            currentFile = found;
+                            LOGV("[SYM]  MODULE %s -> %s\n",
+                                 currentModule.c_str(), currentFile.c_str());
+                        }
+                    }
                 } else {
                     // Try to resolve the module name to a source file.
                     // Module name is uppercase stem: try .C first, then .A51.
@@ -357,11 +408,32 @@ void SymbolTable::ParseM51(const std::string& m51Path, const std::string& buildR
         if (line.find("-------") == 0 && line.find("PROC") != std::string::npos) {
             if (line.find("ENDPROC") != std::string::npos) {
                 // Flush pending locals with the computed procEnd.
+                // Infer variable sizes from address gaps between consecutive
+                // locals in the same memory space.  Sort by (mSpace, addr)
+                // first so adjacent entries in the same space are neighbours.
                 uint32_t procEnd = lastLineAddr + 1;
-                for (auto& pl : pendingLocals) {
+                std::sort(pendingLocals.begin(), pendingLocals.end(),
+                    [](const PendingLocal& a, const PendingLocal& b) {
+                        if (a.mSpace != b.mSpace) return a.mSpace < b.mSpace;
+                        return a.addr < b.addr;
+                    });
+                for (size_t j = 0; j < pendingLocals.size(); ++j) {
+                    auto& pl = pendingLocals[j];
+                    uint8_t sz = 1;  // default: 1 byte
+                    // Look ahead for the next variable in the same memory space.
+                    if (j + 1 < pendingLocals.size() &&
+                        pendingLocals[j + 1].mSpace == pl.mSpace) {
+                        uint32_t gap = pendingLocals[j + 1].addr - pl.addr;
+                        if (gap == 2 || gap == 4) sz = static_cast<uint8_t>(gap);
+                        else if (gap == 3) sz = 4;  // likely padded long
+                        else if (gap > 4) sz = 1;   // big gap — assume 1
+                    }
                     m_locals.push_back({pl.name, pl.mSpace, pl.addr,
-                                        procStartAddr, procEnd});
+                                        procStartAddr, procEnd, sz});
                     ++localCount;
+                    LOG("[SYM]    local: %s @ %c:0x%04X  size=%d\n",
+                        pl.name.c_str(), pl.mSpace == amDATA ? 'D' : 'X',
+                        pl.addr, sz);
                 }
                 pendingLocals.clear();
                 inProc = false;
@@ -421,6 +493,44 @@ void SymbolTable::ParseM51(const std::string& m51Path, const std::string& buildR
             // (though D:/X: lines won't match C: patterns).
         }
 
+        // ---- Parse D:XXXXH / X:XXXXH PUBLIC lines (global variables) ----
+        if (line.size() >= 4 && line[1] == ':' &&
+            (std::toupper(line[0]) == 'D' || std::toupper(line[0]) == 'X')) {
+
+            char spaceChar = static_cast<char>(std::toupper(line[0]));
+            size_t hPos = line.find_first_of("Hh", 2);
+            if (hPos != std::string::npos && line.find("PUBLIC") != std::string::npos) {
+                std::string hexStr = line.substr(2, hPos - 2);
+                size_t dotPos = hexStr.find('.');
+                if (dotPos != std::string::npos)
+                    hexStr = hexStr.substr(0, dotPos);
+                bool allHex = !hexStr.empty() &&
+                    std::all_of(hexStr.begin(), hexStr.end(), [](char c) {
+                        return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+                    });
+                if (allHex) {
+                    uint32_t varAddr = 0;
+                    try { varAddr = static_cast<uint32_t>(std::stoul(hexStr, nullptr, 16)); }
+                    catch (...) { goto skip_global; }
+
+                    uint16_t ms = (spaceChar == 'D') ? amDATA : amXDATA;
+                    size_t pubPos = line.find("PUBLIC");
+                    size_t nameStart = line.find_first_not_of(" \t", pubPos + 6);
+                    if (nameStart != std::string::npos) {
+                        size_t nameEnd = line.find_first_of(" \t\r\n", nameStart);
+                        std::string varName = line.substr(nameStart,
+                            nameEnd == std::string::npos ? std::string::npos
+                                                         : nameEnd - nameStart);
+                        if (!varName.empty() && varName[0] != '?') {
+                            m_globals.push_back({varName, ms, varAddr, 1});
+                            ++globalCount;
+                        }
+                    }
+                }
+            }
+            skip_global:;
+        }
+
         // ---- Parse C:XXXXH lines ----
         if (line.size() < 4 || std::toupper(line[0]) != 'C' || line[1] != ':')
             continue;
@@ -477,8 +587,26 @@ void SymbolTable::ParseM51(const std::string& m51Path, const std::string& buildR
         }
     }
 
-    LOG("[SYM]  m51: %d PUBLIC code symbols, %d line entries, %d locals loaded\n",
-        symCount, lineCount, localCount);
+    // Infer sizes for global variables by sorting by (mSpace, addr) and
+    // looking at address gaps, same approach as for locals.
+    std::sort(m_globals.begin(), m_globals.end(),
+              [](const GlobalVariable& a, const GlobalVariable& b) {
+                  if (a.mSpace != b.mSpace) return a.mSpace < b.mSpace;
+                  return a.addr < b.addr;
+              });
+    for (size_t i = 0; i < m_globals.size(); ++i) {
+        if (i + 1 < m_globals.size() &&
+            m_globals[i + 1].mSpace == m_globals[i].mSpace) {
+            uint32_t gap = m_globals[i + 1].addr - m_globals[i].addr;
+            if (gap == 2 || gap == 4)
+                m_globals[i].size = static_cast<uint8_t>(gap);
+            else if (gap == 3)
+                m_globals[i].size = 4;
+        }
+    }
+
+    LOG("[SYM]  m51: %d PUBLIC code symbols, %d line entries, %d locals, %d globals loaded\n",
+        symCount, lineCount, localCount, globalCount);
 }
 
 // ---------------------------------------------------------------------------
@@ -522,7 +650,33 @@ std::optional<SourceLocation> SymbolTable::LookupLine(uint32_t addr) const
     // Require an exact or very close match (within 64 bytes of a line record).
     if (addr - it->addr > 64u) return std::nullopt;
 
-    return SourceLocation{it->file, it->line};
+    SourceLocation loc{it->file, it->line};
+
+    // Keil sometimes maps the prologue range of a function to the declaration
+    // line, while the first real executable statement appears a few bytes later.
+    // If the current PC is still in that tiny entry/prologue window, prefer the
+    // next nearby line so the debugger lands in the function body.
+    std::string sym = LookupSymbol(addr);
+    if (!sym.empty()) {
+        auto symIt = std::upper_bound(m_symbols.begin(), m_symbols.end(), addr,
+            [](uint32_t a, const Symbol& s) { return a < s.addr; });
+        if (symIt != m_symbols.begin()) {
+            --symIt;
+            auto next = it;
+            ++next;
+            if (next != m_lines.end() &&
+                symIt->addr == it->addr &&
+                next->file == it->file &&
+                next->line > it->line &&
+                next->addr > it->addr &&
+                next->addr - it->addr <= 8u &&
+                addr < next->addr) {
+                loc.line = next->line;
+            }
+        }
+    }
+
+    return loc;
 }
 
 std::optional<uint32_t> SymbolTable::LookupAddress(const std::string& filename,
@@ -554,6 +708,116 @@ std::optional<uint32_t> SymbolTable::LookupSymbolByName(const std::string& name)
     return std::nullopt;
 }
 
+bool SymbolTable::CallsFunction(const std::string& callerName, const std::string& calleeName) const
+{
+    auto callerAddr = LookupSymbolByName(callerName);
+    auto calleeAddr = LookupSymbolByName(calleeName);
+    if (!callerAddr || !calleeAddr || !g_hexLoader.IsLoaded()) return false;
+
+    auto it = std::lower_bound(m_symbols.begin(), m_symbols.end(), *callerAddr,
+        [](const Symbol& s, uint32_t a) { return s.addr < a; });
+    if (it == m_symbols.end() || it->addr != *callerAddr) return false;
+
+    size_t idx = static_cast<size_t>(it - m_symbols.begin());
+    uint32_t start = it->addr;
+    uint32_t end = (idx + 1 < m_symbols.size()) ? m_symbols[idx + 1].addr : (start + 0x200u);
+
+    uint32_t base = g_hexLoader.BaseAddress();
+    uint32_t imageEnd = base + g_hexLoader.ByteCount();
+    if (start < base || start >= imageEnd) return false;
+    end = (std::min)(end, imageEnd);
+
+    auto IsAcallOpcode = [](uint8_t op) -> bool {
+        switch (op) {
+        case 0x11: case 0x31: case 0x51: case 0x71:
+        case 0x91: case 0xB1: case 0xD1: case 0xF1:
+            return true;
+        default:
+            return false;
+        }
+    };
+
+    const UC8* image = g_hexLoader.Image();
+    for (uint32_t pc = start; pc + 1 < end; ++pc) {
+        uint32_t off = pc - base;
+        uint8_t op = image[off];
+
+        if (op == 0x12 && pc + 2 < end) {
+            uint16_t target = (static_cast<uint16_t>(image[off + 1]) << 8) | image[off + 2];
+            if (target == static_cast<uint16_t>(*calleeAddr & 0xFFFFu)) return true;
+            pc += 2;
+        } else if (IsAcallOpcode(op) && pc + 1 < end) {
+            uint16_t target = static_cast<uint16_t>(((pc + 2) & 0xF800u) |
+                              ((static_cast<uint16_t>(op & 0xE0u)) << 3) |
+                              image[off + 1]);
+            if (target == static_cast<uint16_t>(*calleeAddr & 0xFFFFu)) return true;
+            pc += 1;
+        }
+    }
+
+    // Fallback for Keil-generated bank-switch thunks and tail-call style code:
+    // only scan a local source window around the caller's mapped line so
+    // unrelated mentions elsewhere in the file do not create bogus edges.
+    auto callerLoc = LookupLine(*callerAddr);
+    if (callerLoc) {
+        std::ifstream ifs(callerLoc->file);
+        if (ifs.is_open()) {
+            std::string needle = calleeName + "(";
+            std::string line;
+            int lineNo = 0;
+            int firstLine = callerLoc->line > 3 ? callerLoc->line - 3 : 1;
+            int lastLine = callerLoc->line + 160;
+            while (std::getline(ifs, line)) {
+                ++lineNo;
+                if (lineNo < firstLine) continue;
+                if (lineNo > lastLine) break;
+                size_t commentPos = line.find("//");
+                if (commentPos != std::string::npos) {
+                    line.erase(commentPos);
+                }
+                if (line.find(needle) != std::string::npos) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+std::vector<std::string> SymbolTable::FindCallPath(const std::string& ancestorName,
+                                                   const std::string& calleeName,
+                                                   int maxDepth) const
+{
+    if (maxDepth <= 1 || ancestorName.empty() || calleeName.empty() || ancestorName == calleeName)
+        return {};
+
+    std::vector<std::string> best;
+    for (const auto& sym : m_symbols) {
+        const std::string& mid = sym.name;
+        if (mid == ancestorName || mid == calleeName) continue;
+        if (!CallsFunction(ancestorName, mid)) continue;
+
+        if (CallsFunction(mid, calleeName)) {
+            return {mid};
+        }
+
+        if (maxDepth > 2) {
+            auto tail = FindCallPath(mid, calleeName, maxDepth - 1);
+            if (!tail.empty()) {
+                std::vector<std::string> path;
+                path.push_back(mid);
+                path.insert(path.end(), tail.begin(), tail.end());
+                if (best.empty() || path.size() < best.size()) {
+                    best = std::move(path);
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
 std::vector<LocalVariable> SymbolTable::LookupLocals(uint32_t pc) const
 {
     std::vector<LocalVariable> result;
@@ -583,4 +847,33 @@ std::optional<LocalVariable> SymbolTable::LookupLocalByName(const std::string& n
         }
     }
     return std::nullopt;
+}
+
+std::optional<GlobalVariable> SymbolTable::LookupGlobalByName(const std::string& name) const
+{
+    for (const auto& gv : m_globals) {
+        if (gv.name.size() != name.size()) continue;
+        bool match = true;
+        for (size_t i = 0; i < name.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(gv.name[i])) !=
+                std::tolower(static_cast<unsigned char>(name[i]))) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return gv;
+    }
+    return std::nullopt;
+}
+
+std::optional<uint32_t> SymbolTable::NextLineAddr(uint32_t pc) const
+{
+    if (m_lines.empty()) return std::nullopt;
+
+    // m_lines is sorted by addr.  Find the first entry with addr > pc.
+    auto it = std::upper_bound(m_lines.begin(), m_lines.end(), pc,
+        [](uint32_t a, const LineEntry& e) { return a < e.addr; });
+
+    if (it == m_lines.end()) return std::nullopt;
+    return it->addr;
 }
