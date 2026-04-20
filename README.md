@@ -149,15 +149,15 @@ VSCode connects to `127.0.0.1:4711` automatically. The DAP server erases/program
 | `disconnect` / `terminate` | Clean session teardown, DLL reload |
 | `setBreakpoints` | Source-line and address breakpoints via AGDI |
 | `threads` | Single thread "C8051F380" |
-| `stackTrace` | Single frame with function name and source location |
+| `stackTrace` | Shadow call stack with full call chain across step operations |
 | `scopes` | Locals, Registers, CODE, XDATA, DATA, IDATA scopes |
 | `variables` | Local C variables, register values, or raw memory page dump |
 | `evaluate` | Watch/hover: local vars, SFR names, registers, DPTR, hex addresses |
 | `readMemory` | `memoryReference = memSpace<<24 \| address` |
 | `continue` | Run to next breakpoint (WDT auto-disabled) |
-| `next` | Step over (LCALL/ACALL detection with temp breakpoints) |
-| `stepIn` | Single instruction step |
-| `stepOut` | Run to return address (read from 8051 stack) |
+| `next` | Step over (NSTEP loop with CALL detection + AG_GOTILADR for return address) |
+| `stepIn` | Step into (NSTEP loop until source line changes; enters CALLs) |
+| `stepOut` | Step out (RET/RETI scan + AG_GOTILADR; tail-call LJMP/AJMP exit detection) |
 | `pause` | Halt running target |
 
 ---

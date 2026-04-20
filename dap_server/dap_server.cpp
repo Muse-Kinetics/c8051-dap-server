@@ -43,12 +43,82 @@ DapServer* g_pServer = nullptr;
 // stopped event must NOT be sent (a newer command owns the halt).
 static std::atomic<uint32_t> g_runGeneration{0};
 
-// Cached logical call stack for the most recent stop. This lets us preserve
-// tail-called/sibling-called frames that do not exist as a physical return
-// address on the 8051 stack.
-static std::vector<nlohmann::json> g_cachedLogicalFrames;
-static uint32_t g_cachedStackPc = 0xFFFFFFFFu;
-static uint8_t  g_cachedStackSp = 0xFFu;
+// ---------------------------------------------------------------------------
+// Shadow call stack — maintained by step operations.
+//
+// The 8051 hardware stack is unreliable for unwinding because Keil C51 uses
+// PUSH/POP for register saves and tail-call optimizations remove return
+// addresses.  Instead, we track function entry/exit during step operations
+// to build an accurate call stack.
+// ---------------------------------------------------------------------------
+struct ShadowFrame {
+    std::string funcName;
+    uint32_t    pc;       // PC at the time we stopped in this frame
+    std::string file;
+    int         line;
+};
+static std::vector<ShadowFrame> g_shadowStack;
+
+// Update the shadow call stack after any step/halt.  Call this with the
+// current PC after registers have been read.
+static void ShadowStackUpdate(uint32_t pc)
+{
+    std::string curFunc = g_symtab.LookupSymbol(pc);
+    auto loc = g_symtab.LookupLine(pc);
+
+    ShadowFrame curFrame;
+    curFrame.funcName = curFunc;
+    curFrame.pc       = pc;
+    curFrame.file     = loc ? loc->file : "";
+    curFrame.line     = loc ? loc->line : 0;
+
+    if (g_shadowStack.empty()) {
+        // First stop — just push.
+        g_shadowStack.push_back(curFrame);
+        LOG("[SHADOW] init: %s @ 0x%04X\n", curFunc.c_str(), pc);
+        return;
+    }
+
+    // Check if we're in the same function as the top of stack.
+    if (!curFunc.empty() && curFunc == g_shadowStack.back().funcName) {
+        // Same function — just update PC/line.
+        g_shadowStack.back().pc   = pc;
+        g_shadowStack.back().file = curFrame.file;
+        g_shadowStack.back().line = curFrame.line;
+        return;
+    }
+
+    // Function changed.  Determine if this is a step-in, step-out, or
+    // a tail-call/sibling-call.
+
+    // Check if we returned to a function already on the stack.
+    for (int i = static_cast<int>(g_shadowStack.size()) - 2; i >= 0; --i) {
+        if (!curFunc.empty() && curFunc == g_shadowStack[i].funcName) {
+            // Returned to frame i — pop everything above it.
+            size_t popCount = g_shadowStack.size() - 1 - static_cast<size_t>(i);
+            LOG("[SHADOW] return to %s (pop %zu frames)\n", curFunc.c_str(), popCount);
+            g_shadowStack.resize(static_cast<size_t>(i) + 1);
+            g_shadowStack.back().pc   = pc;
+            g_shadowStack.back().file = curFrame.file;
+            g_shadowStack.back().line = curFrame.line;
+            return;
+        }
+    }
+
+    // Not on the stack — this is a step-in or tail-call into a new function.
+    // Check if the previous top function calls this function (step-in).
+    // Or if this is a tail-call (the previous function jumped to a new one).
+    g_shadowStack.push_back(curFrame);
+    LOG("[SHADOW] push %s @ 0x%04X (depth %zu)\n", curFunc.c_str(), pc,
+        g_shadowStack.size());
+}
+
+// Reset the shadow stack (e.g. on continue/launch where we lose tracking).
+static void ShadowStackReset()
+{
+    g_shadowStack.clear();
+    LOG("[SHADOW] reset\n");
+}
 
 // Return the byte length of an 8051 instruction given its opcode.
 static inline uint8_t Opcode8051Length(uint8_t opcode)
@@ -418,6 +488,8 @@ void DapServer::HandleConfigurationDone(int seq, const nlohmann::json& /*args*/)
     // to the client before the event arrives (matches mudap pattern).
     if (m_pendingEntryStop) {
         m_pendingEntryStop = false;
+        ShadowStackReset();
+        ShadowStackUpdate(g_registers.PC());
         std::thread([this]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             SendEvent("stopped", {
@@ -446,9 +518,7 @@ void DapServer::HandleDisconnect(int seq, const nlohmann::json& /*args*/)
     }
     g_hexLoader.Unload();
     g_symtab.Clear();
-    g_cachedLogicalFrames.clear();
-    g_cachedStackPc = 0xFFFFFFFFu;
-    g_cachedStackSp = 0xFFu;
+    ShadowStackReset();
 
     SendResponse(seq, "disconnect");
     m_disconnecting = true;
@@ -665,6 +735,11 @@ static void WaitAndSendStopped(const std::string& reason, uint32_t gen)
     uint32_t pc = g_registers.PC();
     LOG("[DEBUG] Halted at PC=0x%04X  reason=%s\n", pc, reason.c_str());
 
+    // On breakpoint/continue halt, the shadow stack may be stale.
+    // Reset and re-init from the current PC.
+    ShadowStackReset();
+    ShadowStackUpdate(pc);
+
     if (g_pServer) {
         g_pServer->SendEvent("stopped", {
             {"reason",            reason},
@@ -719,6 +794,7 @@ void DapServer::HandleContinue(int seq, const nlohmann::json& /*args*/)
 void DapServer::HandleNext(int seq, const nlohmann::json& args)
 {
     SendResponse(seq, "next");
+    int64_t t0 = StepTimerUs();
 
     // Instruction granularity: one opcode, no source-line loop.
     if (args.value("granularity", "statement") == "instruction") {
@@ -730,64 +806,140 @@ void DapServer::HandleNext(int seq, const nlohmann::json& args)
         return;
     }
 
-    // Source-level step over: single-step instructions until the source line
-    // changes, stepping over CALLs by detecting SP growth and running to the
-    // return address.
+    // Source-level step over via AG_GOTILADR — mirrors µVision's F10.
     //
-    // After each GoStep(NSTEP,1), the DLL refreshes its internal register
-    // cache from hardware before returning.  ReadPcSpCached() reads PC from
-    // that cache and SP via AG_MemAcc (1 USB call per iteration vs 3).
+    // AG_GOTILADR tells the DLL to set an internal temp breakpoint at the
+    // target address and run the target at full 48 MHz speed.  The DLL
+    // manages its own temp BP, so we don't need to allocate from our pool.
+    // This saves USB round trips for BP set/clear and doesn't consume one
+    // of the 4 hardware breakpoint slots from our side.
+    //
+    // For function-end lines (where the next source line is in a different
+    // function), we scan for RET and GOTILADR to it, then NSTEP(1) to
+    // actually execute the RET and land in the caller.
     uint32_t startPC = g_registers.PC();
     auto startLoc = g_symtab.LookupLine(startPC);
+    auto nextAddr = g_symtab.NextLineAddr(startPC);
 
-    if (startLoc && g_symtab.IsLoaded()) {
-        uint8_t startSP = g_registers.SP();
+    if (startLoc && g_symtab.IsLoaded() && nextAddr) {
+        std::string curFunc  = g_symtab.LookupSymbol(startPC);
+        std::string nextFunc = g_symtab.LookupSymbol(*nextAddr);
 
-        for (int i = 0; i < 50000; ++i) {
-            g_runControl.GoStep(AG_NSTEP, 1, nullptr);
-            g_runControl.ReadPcSpCached();
+        if (!curFunc.empty() && curFunc != nextFunc) {
+            // At function end — scan for RET/RETI from current PC to function end.
+            uint32_t funcEnd = *nextAddr;
+            uint32_t scanLen = funcEnd - startPC;
+            if (scanLen > 1024) scanLen = 1024;
 
-            uint32_t pc = g_registers.PC();
-            uint8_t  sp = g_registers.SP();  // cached — not re-read
+            std::vector<UC8> codeBuf(scanLen, 0);
+            GADR codeAddr{};
+            codeAddr.mSpace = amCODE;
+            codeAddr.Adr = (static_cast<UL32>(amCODE) << 24) | startPC;
+            g_agdi.AG_MemAcc(AG_READ, codeBuf.data(), &codeAddr, scanLen);
 
-            // If SP grew, we entered a CALL.  Step out to the return address
-            // so we get step-over semantics.
-            if (sp > startSP) {
-                // Read return address from 8051 stack: [SP]=PCH, [SP-1]=PCL
-                UC8 pclBuf[4] = {}, pchBuf[4] = {};
-                GADR stkAddr{};
-                stkAddr.mSpace = amDATA;
-                stkAddr.Adr = (static_cast<UL32>(amDATA) << 24) | sp;
-                g_agdi.AG_MemAcc(AG_READ, pchBuf, &stkAddr, 1);
-                stkAddr.Adr = (static_cast<UL32>(amDATA) << 24) | (sp - 1);
-                g_agdi.AG_MemAcc(AG_READ, pclBuf, &stkAddr, 1);
-                uint32_t retAddr = (static_cast<uint32_t>(pchBuf[0]) << 8) | pclBuf[0];
-
-                AG_BP* tempBP = g_bpManager.AddTempBreakpoint(retAddr, amCODE);
-                g_runControl.ResetHaltEvent();
-                g_runControl.RequestRun();
-                g_runControl.WaitForHalt(30000);
-                g_bpManager.RemoveTempBreakpoint(tempBP);
-                g_runControl.ReadPcSpCached();
-                pc = g_registers.PC();
-                sp = g_registers.SP();
-                // Fall through to line check — do NOT re-step immediately.
-                // Without this, consecutive CALLs on different source lines
-                // (e.g. MidiServe(); USB_Handler();) would both be stepped over
-                // before the loop stops.
+            uint32_t retOff = 0;
+            bool foundRet = false;
+            while (retOff < scanLen) {
+                uint8_t op = codeBuf[retOff];
+                if (op == 0x22 || op == 0x32) { foundRet = true; break; }
+                uint8_t len = k8051InstructionLength[op];
+                if (len == 0) len = 1;
+                retOff += len;
             }
 
-            // Check if we've moved to a different source line.
-            auto loc = g_symtab.LookupLine(pc);
-            if (!loc) continue;
-            if (loc->file == startLoc->file && loc->line == startLoc->line)
-                continue;
-            break;  // reached a new source line
+            if (foundRet) {
+                uint32_t targetAddr = startPC + retOff;
+                LOG("[STEP] Next at function end (%s), RET at 0x%04X\n",
+                    curFunc.c_str(), targetAddr);
+                // GOTILADR to the RET, then NSTEP(1) to execute it.
+                ++g_runGeneration;
+                g_runControl.ResetHaltEvent();
+                g_runControl.RequestRunToAddr(targetAddr);
+                bool halted = g_runControl.WaitForHalt(5000);
+                if (!halted) {
+                    LOG("[STEP] Step-over timeout — forcing halt\n");
+                    g_runControl.RequestStop();
+                    g_runControl.WaitForHalt(5000);
+                } else {
+                    g_runControl.GoStep(AG_NSTEP, 1, nullptr);
+                    g_runControl.ReadPcSpCached();
+                }
+            } else {
+                LOG("[STEP] Next crosses function boundary (%s -> %s), no RET found\n",
+                    curFunc.c_str(), nextFunc.c_str());
+                // Fall back to GOTILADR to the next line address.
+                ++g_runGeneration;
+                g_runControl.ResetHaltEvent();
+                g_runControl.RequestRunToAddr(*nextAddr);
+                bool halted = g_runControl.WaitForHalt(5000);
+                if (!halted) {
+                    g_runControl.RequestStop();
+                    g_runControl.WaitForHalt(5000);
+                }
+            }
+        } else {
+            // Normal step-over within same function.
+            // NSTEP(1) loop with CALL detection.  Handles conditional
+            // branches correctly — unlike GOTILADR which sets a BP at
+            // the next line address that branches can skip past.
+            int safety = 50;
+            while (safety-- > 0) {
+                uint32_t pc = g_registers.PC();
+                // Read opcode at current PC to check for CALL.
+                UC8 opBuf[1];
+                GADR readAddr{};
+                readAddr.mSpace = amCODE;
+                readAddr.Adr = (static_cast<UL32>(amCODE) << 24) | pc;
+                g_agdi.AG_MemAcc(AG_READ, opBuf, &readAddr, 1);
+                uint8_t op = opBuf[0];
+
+                bool isCall = (op == 0x12) || ((op & 0x1F) == 0x11);
+                if (isCall) {
+                    // Step OVER the call: GOTILADR to the return address
+                    // (instruction after the CALL).  Safe because PC is
+                    // AT the CALL — the function will return here.
+                    uint8_t callLen = k8051InstructionLength[op];
+                    uint32_t returnAddr = pc + callLen;
+                    ++g_runGeneration;
+                    g_runControl.ResetHaltEvent();
+                    g_runControl.RequestRunToAddr(returnAddr);
+                    bool halted = g_runControl.WaitForHalt(10000);
+                    if (!halted) {
+                        g_runControl.RequestStop();
+                        g_runControl.WaitForHalt(5000);
+                        break;
+                    }
+                    g_runControl.ReadPcCached();
+                } else {
+                    g_runControl.GoStep(AG_NSTEP, 1, nullptr);
+                    g_runControl.ReadPcCached();
+                }
+
+                uint32_t newPC = g_registers.PC();
+                auto loc = g_symtab.LookupLine(newPC);
+                if (!loc || loc->file != startLoc->file || loc->line != startLoc->line) {
+                    break;
+                }
+            }
         }
 
+        uint32_t pc = g_registers.PC();
+        int64_t elapsed = StepTimerUs() - t0;
+        ShadowStackUpdate(pc);
+        LOG("[STEP] Step-over 0x%04X -> 0x%04X  (%lld us)\n", startPC, pc, elapsed);
+        SendEvent("stopped", {
+            {"reason",            kStopReasonStep},
+            {"threadId",          kThreadId},
+            {"allThreadsStopped", true},
+        });
+    } else if (startLoc && g_symtab.IsLoaded()) {
+        // Have source info but no next line — last line in symtab.
+        // Fall back to a small instruction-level step.
+        g_runControl.GoStep(AG_NSTEP, 1, nullptr);
         g_runControl.ReadPcSpCached();
         uint32_t pc = g_registers.PC();
-        LOG("[DEBUG] Source step-over complete at PC=0x%04X\n", pc);
+        ShadowStackUpdate(pc);
+        LOG("[STEP] Step-over (last line fallback) 0x%04X -> 0x%04X\n", startPC, pc);
         SendEvent("stopped", {
             {"reason",            kStopReasonStep},
             {"threadId",          kThreadId},
@@ -806,6 +958,7 @@ void DapServer::HandleNext(int seq, const nlohmann::json& args)
 void DapServer::HandleStepIn(int seq, const nlohmann::json& args)
 {
     SendResponse(seq, "stepIn");
+    int64_t t0 = StepTimerUs();
 
     // Instruction granularity: one opcode, no source-line loop.
     if (args.value("granularity", "statement") == "instruction") {
@@ -817,41 +970,111 @@ void DapServer::HandleStepIn(int seq, const nlohmann::json& args)
         return;
     }
 
-    // Source-level step in: single-step instructions until the source line
-    // changes.  Unlike step-over, we do NOT skip CALLs — stepping into a
-    // CALL means the next instruction is inside the called function, which
-    // will map to a different source line and naturally stop us.
+    // Source-level step in via code scan + AG_GOTILADR.
     //
-    // ReadPcCached() reads only PC from the DLL's already-refreshed
-    // register cache — zero USB overhead per iteration.  Step-in does
-    // not need SP (no CALL detection).
+    // 1. Read code bytes between PC and the next source line.
+    // 2. Scan for LCALL/ACALL instructions.
+    // 3. If NO CALL found: identical to step-over — AG_GOTILADR to next line.
+    // 4. If CALL found: step to the CALL instruction with NSTEP(N), then
+    //    one more NSTEP to enter the function, then check if we're on a
+    //    new source line.
     uint32_t startPC = g_registers.PC();
     auto startLoc = g_symtab.LookupLine(startPC);
+    auto nextAddr = g_symtab.NextLineAddr(startPC);
 
-    if (startLoc && g_symtab.IsLoaded()) {
-        for (int i = 0; i < 50000; ++i) {
+    if (startLoc && g_symtab.IsLoaded() && nextAddr) {
+        uint32_t dist = *nextAddr - startPC;
+        if (dist > 64) dist = 64;  // sanity cap
+
+        // Read code bytes from PC to next line boundary.
+        UC8 codeBuf[68] = {};
+        GADR codeAddr{};
+        codeAddr.mSpace = amCODE;
+        codeAddr.Adr = (static_cast<UL32>(amCODE) << 24) | startPC;
+        g_agdi.AG_MemAcc(AG_READ, codeBuf, &codeAddr, dist);
+
+        // Scan for CALL instructions and count instructions before the CALL.
+        int callOffset = -1;       // byte offset of CALL within codeBuf
+        int instrsBefore = 0;      // number of instructions before the CALL
+        uint32_t off = 0;
+        while (off < dist) {
+            uint8_t op = codeBuf[off];
+            bool isCall = (op == 0x12) || ((op & 0x1F) == 0x11);
+            if (isCall) {
+                callOffset = static_cast<int>(off);
+                break;
+            }
+            uint8_t len = k8051InstructionLength[op];
+            if (len == 0) len = 1;  // safety
+            off += len;
+            ++instrsBefore;
+        }
+
+        if (callOffset < 0) {
+            // No CALL found — step instruction-by-instruction until the
+            // source line changes.  NSTEP(1) follows conditional branches
+            // correctly, unlike AG_GOTILADR which sets a BP at a single
+            // address that branches (JNB, JB, CJNE, DJNZ, …) can skip.
+            int safety = 20;
+            while (safety-- > 0) {
+                g_runControl.GoStep(AG_NSTEP, 1, nullptr);
+                g_runControl.ReadPcCached();
+                uint32_t pc2 = g_registers.PC();
+                auto loc2 = g_symtab.LookupLine(pc2);
+                if (!loc2 || loc2->file != startLoc->file || loc2->line != startLoc->line) {
+                    break;
+                }
+            }
+        } else {
+            // CALL found — step to it, then into it.
+            if (instrsBefore > 0) {
+                g_runControl.GoStep(AG_NSTEP, instrsBefore, nullptr);
+            }
+            // One more step enters the called function.
             g_runControl.GoStep(AG_NSTEP, 1, nullptr);
             g_runControl.ReadPcCached();
 
+            // We're now inside the called function.  If the first instruction
+            // doesn't map to a source line (e.g. function prologue), advance
+            // to the first real source line — but ONLY within the same function.
             uint32_t pc = g_registers.PC();
+            std::string enteredFunc = g_symtab.LookupSymbol(pc);
             auto loc = g_symtab.LookupLine(pc);
-            if (!loc)
-                continue;
-            if (loc->file == startLoc->file && loc->line == startLoc->line)
-                continue;
-            break;
+            LOG("[STEP] Step-in: entered 0x%04X func=%s\n", pc, enteredFunc.c_str());
+
+            if (!loc || (loc->file == startLoc->file && loc->line == startLoc->line)) {
+                auto postCallNext = g_symtab.NextLineAddr(pc);
+                // Only prologue-skip if the next line is still in the same function.
+                std::string nextLineFunc = postCallNext ? g_symtab.LookupSymbol(*postCallNext) : "";
+                if (postCallNext && !enteredFunc.empty() && enteredFunc == nextLineFunc) {
+                    LOG("[STEP] Step-in: prologue skip to 0x%04X (same func %s)\n",
+                        *postCallNext, enteredFunc.c_str());
+                    ++g_runGeneration;
+                    g_runControl.ResetHaltEvent();
+                    g_runControl.RequestRunToAddr(*postCallNext);
+                    bool halted = g_runControl.WaitForHalt(5000);
+                    if (!halted) {
+                        g_runControl.RequestStop();
+                        g_runControl.WaitForHalt(5000);
+                    }
+                } else {
+                    LOG("[STEP] Step-in: no prologue skip (nextLine 0x%04X in %s, not %s)\n",
+                        postCallNext ? *postCallNext : 0, nextLineFunc.c_str(), enteredFunc.c_str());
+                }
+            }
         }
 
-        g_runControl.ReadPcSpCached();
         uint32_t pc = g_registers.PC();
-        LOG("[DEBUG] Source step-in complete at PC=0x%04X\n", pc);
+        int64_t elapsed = StepTimerUs() - t0;
+        ShadowStackUpdate(pc);
+        LOG("[STEP] Step-in 0x%04X -> 0x%04X  (%lld us)\n", startPC, pc, elapsed);
         SendEvent("stopped", {
             {"reason",            kStopReasonStep},
             {"threadId",          kThreadId},
             {"allThreadsStopped", true},
         });
     } else {
-        // No source info — single instruction step.
+        // No source info or no next line — single instruction step.
         if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
             g_runControl.ReadPcSpCached();
             uint32_t gen = ++g_runGeneration;
@@ -863,6 +1086,7 @@ void DapServer::HandleStepIn(int seq, const nlohmann::json& args)
 void DapServer::HandleStepOut(int seq, const nlohmann::json& args)
 {
     SendResponse(seq, "stepOut");
+    int64_t t0 = StepTimerUs();
 
     // Instruction granularity: one opcode.
     if (args.value("granularity", "statement") == "instruction") {
@@ -874,58 +1098,190 @@ void DapServer::HandleStepOut(int seq, const nlohmann::json& args)
         return;
     }
 
-    // Source-level step out: single-step until the current frame really
-    // returns. This is slower than a run-to-address shortcut, but it is much
-    // more reliable on the SiLabs 8051 target where AG_GOTILADR can skip to a
-    // deeper breakpoint or miss the immediate caller.
+    // Source-level step out: scan the current function for RET (0x22) and
+    // RETI (0x32) instructions, set temp breakpoints on all of them, then
+    // GOFORBRK.  After the RET BP fires, single-step once to execute the
+    // RET and land in the caller.
+    //
+    // For single-RET functions (common case), we can use AG_GOTILADR
+    // instead, which avoids consuming a hardware breakpoint slot.
+    //
+    // We cannot read the return address from the 8051 internal stack via
+    // AG_MemAcc (the DLL returns zeros for DATA/IDATA), so we scan for
+    // RET instructions instead.
     uint32_t startPC = g_registers.PC();
-    uint8_t  startSP = g_registers.SP();
-    auto startLoc = g_symtab.LookupLine(startPC);
-    std::string currentFunction = g_symtab.LookupSymbol(startPC);
-    std::string expectedCaller;
-    if (g_cachedLogicalFrames.size() >= 2) {
-        expectedCaller = g_cachedLogicalFrames[1].value("name", "");
-    }
 
-    if (startLoc && g_symtab.IsLoaded()) {
-        for (int i = 0; i < 50000; ++i) {
-            g_runControl.GoStep(AG_NSTEP, 1, nullptr);
-            g_runControl.ReadPcSpCached();
-
-            uint32_t pc = g_registers.PC();
-            uint8_t  sp = g_registers.SP();
-            auto loc = g_symtab.LookupLine(pc);
-            std::string func = g_symtab.LookupSymbol(pc);
-
-            bool returnedToCaller = false;
-            bool stackPoppedReturn = (sp + 2 <= startSP);
-            if (!expectedCaller.empty() && func == expectedCaller && stackPoppedReturn) {
-                returnedToCaller = true;
-            } else if (!currentFunction.empty() && func != currentFunction && stackPoppedReturn) {
-                returnedToCaller = true;
-            } else if (stackPoppedReturn) {
-                returnedToCaller = true;
-            }
-
-            if (!returnedToCaller)
-                continue;
-            if (!loc)
-                break;
-            if (loc->file == startLoc->file && loc->line == startLoc->line)
-                continue;
-            break;
+    if (g_symtab.IsLoaded()) {
+        // Find function boundaries from symbol table.
+        std::string funcName = g_symtab.LookupSymbol(startPC);
+        uint32_t funcStart = startPC;
+        if (!funcName.empty()) {
+            auto addr = g_symtab.LookupSymbolByName(funcName);
+            if (addr) funcStart = *addr;
         }
 
-        g_runControl.ReadPcSpCached();
-        uint32_t pc = g_registers.PC();
-        LOG("[DEBUG] Source step-out complete at PC=0x%04X\n", pc);
-        SendEvent("stopped", {
-            {"reason",            kStopReasonStep},
-            {"threadId",          kThreadId},
-            {"allThreadsStopped", true},
-        });
+        // Find the next function's start address to determine our function's end.
+        uint32_t funcEnd = funcStart + 4096;  // safety cap
+        {
+            auto nextFuncAddr = g_symtab.NextSymbolAddr(funcStart);
+            if (nextFuncAddr) funcEnd = *nextFuncAddr;
+        }
+
+        // Scan from current PC (not function start) to function end.
+        uint32_t scanFrom = startPC;
+        uint32_t codeLen = funcEnd - scanFrom;
+        if (codeLen > 8192) codeLen = 8192;  // generous cap
+
+        LOG("[STEP] Step-out: func=%s funcStart=0x%04X funcEnd=0x%04X scanFrom=0x%04X len=%u\n",
+            funcName.c_str(), funcStart, funcEnd, scanFrom, codeLen);
+
+        // Read code bytes from PC to function end.
+        std::vector<UC8> codeBuf(codeLen, 0);
+        GADR codeAddr{};
+        codeAddr.mSpace = amCODE;
+        codeAddr.Adr = (static_cast<UL32>(amCODE) << 24) | scanFrom;
+        g_agdi.AG_MemAcc(AG_READ, codeBuf.data(), &codeAddr, codeLen);
+
+        // Scan for all RET/RETI and exit jumps using instruction length table.
+        std::vector<uint32_t> retAddrs;   // RET/RETI addresses (need NSTEP after)
+        std::vector<uint32_t> exitAddrs;  // LJMP/AJMP targets outside function (no NSTEP needed)
+        uint32_t off = 0;
+        while (off < codeLen) {
+            uint8_t op = codeBuf[off];
+            if (op == 0x22 || op == 0x32) {
+                retAddrs.push_back(scanFrom + off);
+            } else if (op == 0x02 && off + 2 < codeLen) {
+                // LJMP addr16: target = (byte1 << 8) | byte2
+                uint32_t target = (static_cast<uint32_t>(codeBuf[off + 1]) << 8) | codeBuf[off + 2];
+                if (target < funcStart || target >= funcEnd) {
+                    exitAddrs.push_back(target);
+                    LOG("[STEP] Step-out: LJMP at 0x%04X -> 0x%04X (exit)\n", scanFrom + off, target);
+                }
+            } else if ((op & 0x1F) == 0x01 && off + 1 < codeLen) {
+                // AJMP: target = ((op >> 5) << 8 | byte1) within same 2K page
+                uint32_t instrAddr = scanFrom + off;
+                uint32_t page = (instrAddr + 2) & 0xF800;
+                uint32_t target = page | (static_cast<uint32_t>(op >> 5) << 8) | codeBuf[off + 1];
+                if (target < funcStart || target >= funcEnd) {
+                    exitAddrs.push_back(target);
+                    LOG("[STEP] Step-out: AJMP at 0x%04X -> 0x%04X (exit)\n", scanFrom + off, target);
+                }
+            }
+            uint8_t len = k8051InstructionLength[op];
+            if (len == 0) len = 1;
+            off += len;
+        }
+
+        for (uint32_t ra : retAddrs) {
+            LOG("[STEP] Step-out: RET at 0x%04X\n", ra);
+        }
+
+        if (!retAddrs.empty()) {
+            bool halted = false;
+
+            if (retAddrs.size() == 1) {
+                // Single RET — use AG_GOTILADR (no hardware BP consumed).
+                ++g_runGeneration;
+                g_runControl.ResetHaltEvent();
+                g_runControl.RequestRunToAddr(retAddrs[0]);
+                halted = g_runControl.WaitForHalt(10000);
+            } else {
+                // Multiple RETs — set temp BPs on all and GOFORBRK.
+                std::vector<AG_BP*> tempBPs;
+                for (uint32_t ra : retAddrs) {
+                    AG_BP* bp = g_bpManager.AddTempBreakpoint(ra, amCODE);
+                    if (bp) tempBPs.push_back(bp);
+                }
+
+                ++g_runGeneration;
+                g_runControl.ResetHaltEvent();
+                g_runControl.RequestRun();
+                halted = g_runControl.WaitForHalt(10000);
+
+                for (auto* bp : tempBPs)
+                    g_bpManager.RemoveTempBreakpoint(bp);
+            }
+
+            if (!halted) {
+                LOG("[STEP] Step-out timeout — forcing halt\n");
+                g_runControl.RequestStop();
+                g_runControl.WaitForHalt(5000);
+            } else {
+                // On the RET — single-step to execute it and land in caller.
+                g_runControl.GoStep(AG_NSTEP, 1, nullptr);
+                g_runControl.ReadPcSpCached();
+            }
+
+            uint32_t pc = g_registers.PC();
+            int64_t elapsed = StepTimerUs() - t0;
+            ShadowStackUpdate(pc);
+            LOG("[STEP] Step-out 0x%04X -> 0x%04X  (%lld us)\n", startPC, pc, elapsed);
+            SendEvent("stopped", {
+                {"reason",            kStopReasonStep},
+                {"threadId",          kThreadId},
+                {"allThreadsStopped", true},
+            });
+        } else if (!exitAddrs.empty()) {
+            // No RET, but found LJMP/AJMP exits (tail-call optimization).
+            // Run to the jump target — no NSTEP needed because the jump
+            // itself transfers control out of the function.
+            LOG("[STEP] Step-out: no RET, using %zu exit jump target(s)\n", exitAddrs.size());
+            bool halted = false;
+
+            if (exitAddrs.size() == 1) {
+                ++g_runGeneration;
+                g_runControl.ResetHaltEvent();
+                g_runControl.RequestRunToAddr(exitAddrs[0]);
+                halted = g_runControl.WaitForHalt(10000);
+            } else {
+                std::vector<AG_BP*> tempBPs;
+                for (uint32_t ea : exitAddrs) {
+                    AG_BP* bp = g_bpManager.AddTempBreakpoint(ea, amCODE);
+                    if (bp) tempBPs.push_back(bp);
+                }
+                ++g_runGeneration;
+                g_runControl.ResetHaltEvent();
+                g_runControl.RequestRun();
+                halted = g_runControl.WaitForHalt(10000);
+                for (auto* bp : tempBPs)
+                    g_bpManager.RemoveTempBreakpoint(bp);
+            }
+
+            if (!halted) {
+                LOG("[STEP] Step-out timeout — forcing halt\n");
+                g_runControl.RequestStop();
+                g_runControl.WaitForHalt(5000);
+            }
+
+            // We're at the tail-call target.  The original function exited
+            // via LJMP.  The user can step-out again to return to the caller.
+            uint32_t pc = g_registers.PC();
+            int64_t elapsed = StepTimerUs() - t0;
+            ShadowStackUpdate(pc);
+            LOG("[STEP] Step-out (tail-call) 0x%04X -> 0x%04X  (%lld us)\n", startPC, pc, elapsed);
+            SendEvent("stopped", {
+                {"reason",            kStopReasonStep},
+                {"threadId",          kThreadId},
+                {"allThreadsStopped", true},
+            });
+        } else {
+            LOG("[STEP] Step-out: no RET found in function (first 32 bytes from 0x%04X):\n", scanFrom);
+            char hexline[128] = {};
+            int pos = 0;
+            for (uint32_t i = 0; i < codeLen && i < 32; ++i) {
+                pos += snprintf(hexline + pos, sizeof(hexline) - pos, "%02X ", codeBuf[i]);
+            }
+            LOG("[STEP]   %s\n", hexline);
+
+            // Last resort: single step.
+            if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
+                g_runControl.ReadPcSpCached();
+                uint32_t gen = ++g_runGeneration;
+                std::thread(WaitAndSendStopped, kStopReasonStep, gen).detach();
+            }
+        }
     } else {
-        LOG("[DEBUG] Step out: no source info available, falling back to single step\n");
+        LOG("[DEBUG] Step out: no symbol table, falling back to single step\n");
         if (g_runControl.GoStep(AG_NSTEP, 1, nullptr)) {
             g_runControl.ReadPcSpCached();
             uint32_t gen = ++g_runGeneration;
@@ -953,6 +1309,8 @@ void DapServer::HandlePause(int seq, const nlohmann::json& /*args*/)
     g_runControl.ReadRegisters();            // active register read via RegDsc
 
     uint32_t pc = g_registers.PC();
+    ShadowStackReset();
+    ShadowStackUpdate(pc);
     LOG("[DEBUG] HandlePause: halted at PC=0x%04X\n", pc);
 
     SendEvent("stopped", {
@@ -974,20 +1332,18 @@ void DapServer::HandleStackTrace(int seq, const nlohmann::json& args)
         return (slash == std::string::npos) ? path : path.substr(slash + 1);
     };
 
-    auto MakeFrame = [&](int frameId, uint32_t pc) -> nlohmann::json {
-        auto loc = g_symtab.LookupLine(pc);
-        std::string sym = g_symtab.LookupSymbol(pc);
-
+    auto MakeFrame = [&](int frameId, const std::string& funcName,
+                         uint32_t pc, const std::string& file, int line) -> nlohmann::json {
         char pcBuf[12];
         _snprintf_s(pcBuf, sizeof(pcBuf), "0x%04X", pc & 0xFFFF);
-        std::string frameName = sym.empty() ? std::string(pcBuf) : sym;
+        std::string frameName = funcName.empty() ? std::string(pcBuf) : funcName;
 
-        if (loc) {
+        if (!file.empty() && line > 0) {
             return {
                 {"id",     frameId},
                 {"name",   frameName},
-                {"source", {{"name", BaseName(loc->file)}, {"path", loc->file}, {"presentationHint", "normal"}}},
-                {"line",   loc->line},
+                {"source", {{"name", BaseName(file)}, {"path", file}, {"presentationHint", "normal"}}},
+                {"line",   line},
                 {"column", 1},
                 {"instructionReference", std::string(pcBuf)},
             };
@@ -1002,192 +1358,29 @@ void DapServer::HandleStackTrace(int seq, const nlohmann::json& args)
         };
     };
 
-    std::vector<nlohmann::json> allFrames;
-    uint32_t currentPc = g_registers.PC();
-    allFrames.push_back(MakeFrame(1, currentPc));
-
-    auto IsAcallOpcode = [](uint8_t op) -> bool {
-        switch (op) {
-        case 0x11: case 0x31: case 0x51: case 0x71:
-        case 0x91: case 0xB1: case 0xD1: case 0xF1:
-            return true;
-        default:
-            return false;
-        }
-    };
-
-    uint8_t sp = g_registers.SP();
-    if (currentPc != 0 && g_agdi.AG_MemAcc && sp > 7) {
-        LOGV("[STACK] unwind start: PC=0x%04X SP=0x%02X\n", currentPc, sp);
-
-        std::vector<UC8> stackBuf(static_cast<size_t>(sp) + 5, 0);
-        GADR addr{};
-        addr.mSpace = amDATA;
-        addr.Adr = (static_cast<UL32>(amDATA) << 24) | 0x00;
-
-        g_agdi.AG_MemAcc(AG_READ, stackBuf.data(), &addr, static_cast<UL32>(sp) + 1);
-
-        // Scan EVERY adjacent byte pair, not just even-aligned ones. The 8051
-        // stack can contain PUSHed registers/temporaries, so the saved return
-        // address is not guaranteed to stay on a 2-byte boundary while stepping.
-        for (int top = static_cast<int>(sp); top >= 2; --top) {
-            uint16_t retAddr = (static_cast<uint16_t>(stackBuf[top]) << 8) | stackBuf[top - 1];
-            if (retAddr < 2 || retAddr == 0xFFFF)
-                continue;
-
-            uint32_t callerPc = 0;
-            bool validCall = false;
-
-            UC8 codeBuf[4] = {};
-            GADR codeAddr{};
-            codeAddr.mSpace = amCODE;
-
-            if (retAddr >= 3) {
-                codeAddr.Adr = (static_cast<UL32>(amCODE) << 24) | ((retAddr - 3) & 0xFFFF);
-                g_agdi.AG_MemAcc(AG_READ, codeBuf, &codeAddr, 3);
-
-                if (codeBuf[0] == 0x12) {
-                    callerPc = static_cast<uint32_t>(retAddr - 3);  // LCALL
-                    validCall = true;
-                } else if (IsAcallOpcode(codeBuf[1])) {
-                    callerPc = static_cast<uint32_t>(retAddr - 2);  // ACALL
-                    validCall = true;
-                }
-            } else {
-                codeAddr.Adr = (static_cast<UL32>(amCODE) << 24) | ((retAddr - 2) & 0xFFFF);
-                g_agdi.AG_MemAcc(AG_READ, codeBuf, &codeAddr, 2);
-                if (IsAcallOpcode(codeBuf[0])) {
-                    callerPc = static_cast<uint32_t>(retAddr - 2);
-                    validCall = true;
-                }
-            }
-
-            if (!validCall)
-                continue;
-
-            auto loc = g_symtab.LookupLine(callerPc);
-            std::string sym = g_symtab.LookupSymbol(callerPc);
-            if (!loc && sym.empty())
-                continue;
-
-            if (allFrames.size() > 1) {
-                std::string prevRef = allFrames.back().value("instructionReference", "");
-                char pcBuf[12];
-                _snprintf_s(pcBuf, sizeof(pcBuf), "0x%04X", callerPc & 0xFFFF);
-                if (prevRef == pcBuf)
-                    continue;
-            }
-
-            LOGV("[STACK] frame %d: callerPC=0x%04X ret=0x%04X stackTop=0x%02X sym=%s\n",
-                 static_cast<int>(allFrames.size()) + 1, callerPc, retAddr, top,
-                 sym.empty() ? "<none>" : sym.c_str());
-
-            allFrames.push_back(MakeFrame(static_cast<int>(allFrames.size()) + 1, callerPc));
-            if (allFrames.size() >= 8)
-                break;
-        }
-    }
-
-    auto FrameKey = [](const nlohmann::json& frame) -> std::string {
-        return frame.value("name", "") + "|" + frame.value("instructionReference", "");
-    };
-    auto FrameName = [](const nlohmann::json& frame) -> std::string {
-        return frame.value("name", "");
-    };
-
-    std::vector<nlohmann::json> logicalFrames = allFrames;
-    if (g_cachedStackPc == currentPc && g_cachedStackSp == sp && !g_cachedLogicalFrames.empty()) {
-        logicalFrames = g_cachedLogicalFrames;
-    } else {
-        // If the new physical stack shares the same caller-chain suffix as the
-        // previous logical stack, keep the missing middle frames. This covers
-        // Keil tail-calls where the callee reuses the caller's return address.
-        if (!g_cachedLogicalFrames.empty() && allFrames.size() >= 2) {
-            size_t i = allFrames.size();
-            size_t j = g_cachedLogicalFrames.size();
-            size_t commonSuffix = 0;
-            while (i > 1 && j > 1 && FrameKey(allFrames[i - 1]) == FrameKey(g_cachedLogicalFrames[j - 1])) {
-                --i;
-                --j;
-                ++commonSuffix;
-            }
-
-            bool topFunctionChanged = FrameName(allFrames[0]) != FrameName(g_cachedLogicalFrames[0]);
-            bool cachedTopCallsNewTop = g_symtab.CallsFunction(FrameName(g_cachedLogicalFrames[0]),
-                                                               FrameName(allFrames[0]));
-            // Only preserve cached frames when the top function changed — this
-            // indicates a step-into-new-function where Keil elided intermediate
-            // return addresses.  Do NOT preserve when the top function is the
-            // same but the stack shrank: that means a genuine return happened
-            // and the deeper frames truly no longer exist.
-            if (topFunctionChanged &&
-                ((commonSuffix >= 2) || (commonSuffix >= 1 && cachedTopCallsNewTop)) &&
-                j > 0) {
-                std::vector<nlohmann::json> merged;
-                merged.push_back(allFrames[0]);
-
-                size_t cachedStart = topFunctionChanged ? 0 : 1;
-                for (size_t k = cachedStart; k < j; ++k) {
-                    if (FrameKey(merged.back()) != FrameKey(g_cachedLogicalFrames[k])) {
-                        merged.push_back(g_cachedLogicalFrames[k]);
-                    }
-                }
-                for (size_t k = 1; k < allFrames.size(); ++k) {
-                    if (FrameKey(merged.back()) != FrameKey(allFrames[k])) {
-                        merged.push_back(allFrames[k]);
-                    }
-                }
-                logicalFrames = std::move(merged);
-                LOGV("[STACK] logical chain preserved: physical=%d logical=%d\n",
-                     (int)allFrames.size(), (int)logicalFrames.size());
-            }
-        }
-
-        // Fallback for sparse physical stacks on Keil/8051: if only a shallow
-        // ancestor survived on the stack, use the static call graph from the
-        // loaded HEX image to restore plausible missing middle frames.
-        if (logicalFrames.size() == allFrames.size() && allFrames.size() >= 2) {
-            std::string topName = FrameName(allFrames[0]);
-            std::string ancestorName = FrameName(allFrames[1]);
-            auto missingPath = g_symtab.FindCallPath(ancestorName, topName, 3);
-            if (!missingPath.empty()) {
-                std::vector<nlohmann::json> augmented;
-                augmented.push_back(allFrames[0]);
-                for (auto itName = missingPath.rbegin(); itName != missingPath.rend(); ++itName) {
-                    auto addr = g_symtab.LookupSymbolByName(*itName);
-                    if (addr) {
-                        auto frame = MakeFrame(static_cast<int>(augmented.size()) + 1, *addr);
-                        if (FrameKey(augmented.back()) != FrameKey(frame)) {
-                            augmented.push_back(frame);
-                        }
-                    }
-                }
-                for (size_t k = 1; k < allFrames.size(); ++k) {
-                    if (FrameKey(augmented.back()) != FrameKey(allFrames[k])) {
-                        augmented.push_back(allFrames[k]);
-                    }
-                }
-                logicalFrames = std::move(augmented);
-                LOGV("[STACK] static call path restored: physical=%d logical=%d\n",
-                     (int)allFrames.size(), (int)logicalFrames.size());
-            }
-        }
-
-        for (size_t idx = 0; idx < logicalFrames.size(); ++idx) {
-            logicalFrames[idx]["id"] = static_cast<int>(idx) + 1;
-        }
-
-        g_cachedLogicalFrames = logicalFrames;
-        g_cachedStackPc = currentPc;
-        g_cachedStackSp = sp;
-    }
-
+    // Build frames from the shadow call stack (maintained by step operations).
+    // The shadow stack is ordered bottom-to-top: [0]=deepest, [last]=current.
+    // DAP expects top-of-stack first.
     nlohmann::json frames = nlohmann::json::array();
-    int totalFrames = static_cast<int>(logicalFrames.size());
-    if (startFrame > totalFrames) startFrame = totalFrames;
-    int endFrame = ((startFrame + levels) < totalFrames) ? (startFrame + levels) : totalFrames;
-    for (int i = startFrame; i < endFrame; ++i) {
-        frames.push_back(logicalFrames[static_cast<size_t>(i)]);
+    int totalFrames = static_cast<int>(g_shadowStack.size());
+
+    if (totalFrames == 0) {
+        // Fallback: no shadow stack — just show current PC.
+        uint32_t pc = g_registers.PC();
+        std::string sym = g_symtab.LookupSymbol(pc);
+        auto loc = g_symtab.LookupLine(pc);
+        frames.push_back(MakeFrame(1, sym, pc,
+                                   loc ? loc->file : "", loc ? loc->line : 0));
+        totalFrames = 1;
+    } else {
+        if (startFrame > totalFrames) startFrame = totalFrames;
+        int endFrame = ((startFrame + levels) < totalFrames) ? (startFrame + levels) : totalFrames;
+        for (int i = startFrame; i < endFrame; ++i) {
+            // Shadow stack is bottom-to-top; DAP wants top-first.
+            int shadowIdx = totalFrames - 1 - i;
+            const auto& sf = g_shadowStack[static_cast<size_t>(shadowIdx)];
+            frames.push_back(MakeFrame(i + 1, sf.funcName, sf.pc, sf.file, sf.line));
+        }
     }
 
     nlohmann::json body = {

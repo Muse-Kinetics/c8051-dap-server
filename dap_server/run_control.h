@@ -95,6 +95,14 @@ public:
     // Call ResetHaltEvent() before this, then WaitForHalt() to detect completion.
     void RequestRun();
 
+    // Post a run-to-address request (AG_GOTILADR) to the HWND.
+    // The DLL sets its own internal temp breakpoint at the target address,
+    // runs the target, and returns when it halts.  This mirrors µVision's
+    // F10 (step-over) mechanism.  No explicit temp BP management required.
+    // addr is the 16-bit CODE address (0x0000–0xFFFF).
+    // Call ResetHaltEvent() before this, then WaitForHalt() to detect completion.
+    void RequestRunToAddr(uint32_t addr);
+
     // Post a register-refresh request (AG_NSTEP(1)) to the main thread.
     // Used by HandlePause after StopDirect returns to trigger AG_CB_INITREGV.
     void RequestRegRefresh();

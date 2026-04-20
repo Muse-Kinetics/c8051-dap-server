@@ -493,6 +493,29 @@ LRESULT CALLBACK RunControl::HwndMsgProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     }
 
+    // WM_USER+5: run-to-address request (AG_GOTILADR) from the reader thread.
+    // The DLL places an internal temp breakpoint at the target address and
+    // runs the target until it halts (same mechanism µVision uses for F10).
+    // LPARAM carries the 16-bit CODE address directly.
+    if (msg == WM_USER + 5) {
+        uint32_t addr = static_cast<uint32_t>(lp);
+        LOG("[DEBUG] HwndMsgProc: GOTILADR request — target addr 0x%04X\n", addr);
+        if (g_agdi.AG_GoStep) {
+            GADR gadr{};
+            gadr.Adr    = (static_cast<UL32>(amCODE) << 24) | addr;
+            gadr.mSpace = amCODE;
+            DWORD exc = CallGoStepSEH(AG_GOTILADR, 0, &gadr);
+            if (exc) {
+                LOG("[CRASH] SEH exception 0x%08lX in AG_GoStep(AG_GOTILADR, 0x%04X)\n", exc, addr);
+            } else {
+                LOG("[DEBUG] HwndMsgProc: GoStep(AG_GOTILADR) returned\n");
+            }
+        }
+        g_runControl.ReadRegisters();
+        g_runControl.SignalHalt("stopped");
+        return 0;
+    }
+
     if (msg == WM_DESTROY) {
         PostQuitMessage(0);
         return 0;
@@ -896,6 +919,13 @@ void RunControl::RequestRun()
 {
     if (m_hwnd) {
         PostMessage(m_hwnd, WM_USER + 3, 0, 0);
+    }
+}
+
+void RunControl::RequestRunToAddr(uint32_t addr)
+{
+    if (m_hwnd) {
+        PostMessage(m_hwnd, WM_USER + 5, 0, static_cast<LPARAM>(addr));
     }
 }
 

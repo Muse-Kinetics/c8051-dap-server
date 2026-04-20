@@ -15,9 +15,27 @@
 #include <cstdio>
 #include <cstdarg>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 // Sends formatted text as a DAP "output" event to VS Code's Debug Console.
 // No-op when no DAP client is connected.  Defined in dap_server.cpp.
 void DapLogSend(const char* fmt, ...);
+
+// High-resolution timer for performance measurement (microseconds).
+#ifdef _WIN32
+inline int64_t StepTimerUs()
+{
+    static LARGE_INTEGER freq = {};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (now.QuadPart * 1000000LL) / freq.QuadPart;
+}
+#else
+inline int64_t StepTimerUs() { return 0; }
+#endif
 
 #define LOG(fmt, ...) \
     do { \

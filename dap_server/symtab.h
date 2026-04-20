@@ -118,6 +118,10 @@ public:
     // Returns nullopt if pc is at or past the last line entry.
     std::optional<uint32_t> NextLineAddr(uint32_t pc) const;
 
+    // Return the start address of the next symbol after `addr`.
+    // Used to determine function end boundaries for step-out.
+    std::optional<uint32_t> NextSymbolAddr(uint32_t addr) const;
+
     // Return true if the caller function contains a direct ACALL/LCALL to the
     // callee function in the loaded HEX image.
     bool CallsFunction(const std::string& callerName, const std::string& calleeName) const;

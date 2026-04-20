@@ -877,3 +877,14 @@ std::optional<uint32_t> SymbolTable::NextLineAddr(uint32_t pc) const
     if (it == m_lines.end()) return std::nullopt;
     return it->addr;
 }
+
+std::optional<uint32_t> SymbolTable::NextSymbolAddr(uint32_t addr) const
+{
+    if (m_symbols.empty()) return std::nullopt;
+
+    auto it = std::upper_bound(m_symbols.begin(), m_symbols.end(), addr,
+        [](uint32_t a, const Symbol& s) { return a < s.addr; });
+
+    if (it == m_symbols.end()) return std::nullopt;
+    return it->addr;
+}

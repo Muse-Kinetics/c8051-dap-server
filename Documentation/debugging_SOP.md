@@ -27,6 +27,11 @@ Trigger: log shows any of:
 - `[ERROR] AGDI session init failed`
 - Server stuck at `[AGDI] Loading SiC8051F.dll and registering session...`
 
+**Important:** Kill all `dap_server.exe` instances **before** resetting the EC3 adapter —
+the server holds the USB handle and the adapter won't reset while it's open.
+`reset_silabs.ps1` handles this automatically, but if running steps manually, stop
+the server first.
+
 Steps:
 1. Stop the debug session in VS Code (disconnect).
 2. `& "...\scripts\stop_server.ps1"` — stops `dap_server.exe`.
@@ -37,14 +42,22 @@ Steps:
 ## Normal Session Flow
 1. Continue to a breakpoint with `mcp_debug-mcp_continue_debugging`.
 2. Check the call stack in the `stop_event_data.call_stack` field of the response.
+   - The call stack uses a **shadow stack** maintained by step operations.
+   - After `continue` (free-run), the shadow stack resets — only the current function is shown.
+   - After stepping (step-in, step-over, step-out), the full call chain is preserved.
 3. Step in/out/over with `mcp_debug-mcp_step_execution`.
-4. If the stack looks wrong, re-check after the next stop — compiler tail-calls can hide frames transiently.
+4. The call stack is most useful during step sequences — step into a function to see
+   caller frames build up, step out to see them unwind.
 
 ## Key Constraints
 - **Max 3 breakpoints** — the hardware path is unreliable beyond that.
 - **Never use `mcp_debug-mcp_start_debugging`** — always use `run_vscode_command workbench.action.debug.start`.
 - **`reset_silabs.ps1`** contacts a remote USB power-cycle server at `192.168.1.67:9275`. It must return `OK done` before proceeding.
 - After any abnormal termination, always run the full recovery sequence before relaunching.
+- **Multi-root workspace terminal CWD** — this repo is typically opened alongside the
+  firmware project in a multi-root workspace. When you open a new terminal in VS Code,
+  the default CWD may be the firmware folder, not the DAP server folder. Always verify
+  the working directory (`$PWD` / `Get-Location`) before running scripts.
 
 ## Popup Capture Procedure
 If a popup appears:
