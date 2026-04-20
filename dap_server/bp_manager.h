@@ -24,8 +24,10 @@
 #include "agdi.h"
 
 // Maximum simultaneous breakpoints.  8051 hardware typically supports 4 HW BPs
-// but AGDI implements software BPs too; 32 is a safe upper bound.
-constexpr int kMaxBreakpoints = 32;
+// but AGDI implements software BPs too; pool includes room for temp BPs used
+// by step-over / step-out.
+constexpr int kMaxBreakpoints     = 12;
+constexpr int kMaxUserBreakpoints = 4;
 
 // ---------------------------------------------------------------------------
 // BpManager
@@ -42,10 +44,15 @@ public:
     // Update breakpoints for a single source file.
     // Called from the setBreakpoints DAP handler.
     // 'mSpace' is amCODE for code breakpoints.
-    // Returns the count of successfully set breakpoints for this file.
+    // Returns the count of breakpoints actually armed for this file.
+    // Sets armedPerFile to the number armed (may be less than count if
+    // the global limit kMaxUserBreakpoints is hit).
     int SetFileBreakpoints(const std::string& sourcePath,
                            const uint32_t* addresses, int count,
                            uint16_t mSpace);
+
+    // Returns the total number of user breakpoints currently armed.
+    int TotalUserBreakpoints() const;
 
     // Remove all breakpoints and notify the DLL.
     void ClearAll();
@@ -73,7 +80,8 @@ private:
     std::unordered_map<std::string, std::vector<uint32_t>> m_fileBreakpoints;
 
     // Rebuild the DLL breakpoint list from all per-file entries.
-    void RebuildDllBreakpoints(uint16_t mSpace);
+    // Returns the total number of user BPs actually armed.
+    int RebuildDllBreakpoints(uint16_t mSpace);
 
     AG_BP* Alloc();
     void   Free(AG_BP* bp);

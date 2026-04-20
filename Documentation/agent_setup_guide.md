@@ -36,20 +36,21 @@ Microsoft DAP server over TCP port 4711, allowing VSCode to debug or flash the t
 | `stepOut` (return addr from stack) | ✅ HW verified |
 | `setBreakpoints` (source line + address) | ✅ HW verified |
 | `evaluate` (watch/hover: locals, SFRs, regs) | ✅ HW verified |
-| `readMemory` | ✅ Implemented |
+| `setVariable` / `setExpression` (edit values) | ✅ HW verified |
+| `readMemory` | ✅ HW verified |
+| `writeMemory` | ✅ HW verified |
+| Breakpoint limit enforcement (4 HW max) | ✅ HW verified |
 | Source mapping (m51 LINE# → file:line) | ✅ Working |
-| Local variables (Locals panel from m51 PROC) | ✅ Implemented (values under investigation) |
+| Local variables (Locals panel from m51 PROC) | ✅ HW verified |
+| Custom debug views (Registers, DATA, XDATA, IDATA, CODE) | ✅ Working |
 | VSCode extension (silabs8051 debug type) | ✅ Working — F5 launches session |
 | Crash recovery (VSCode killed without disconnect) | ✅ Fixed — server auto-cleans |
 
 ## Known Issues / Active Investigation
 
-- **Locals showing 0x00** — The Locals panel displays variables but values may show as
-  0x00. Under investigation — possible m51 address mapping issue.
-- **Watch shows 8-bit for 16-bit `int`** — m51 has no type info; all reads are 1 byte.
-  Keil C51 `int` is 16-bit.
-- **Pause button** — DAP pause request never arrives from VSCode. See BUG-1 in
-  `DAP_implementation_status.md`.
+- **Memory Inspector** — VS Code's built-in Memory Inspector panel does not appear
+  despite `supportsMemoryReferences` and `supportsReadMemoryRequest` capabilities.
+  Custom debug views (Registers, DATA, etc.) are used as a workaround.
 
 ---
 

@@ -454,6 +454,9 @@ void DapServer::Dispatch(const nlohmann::json& msg)
     else if (command == "variables")         HandleVariables        (seq, args);
     else if (command == "readMemory")        HandleReadMemory       (seq, args);
     else if (command == "evaluate")          HandleEvaluate         (seq, args);
+    else if (command == "setVariable")      HandleSetVariable      (seq, args);
+    else if (command == "setExpression")    HandleSetExpression    (seq, args);
+    else if (command == "writeMemory")      HandleWriteMemory      (seq, args);
     else if (command == "source")            HandleSource           (seq, args);
     else {
         LOG("[DAP]  <- %s: not implemented\n", command.c_str());
@@ -670,10 +673,10 @@ void DapServer::HandleSetBreakpoints(int seq, const nlohmann::json& args)
         }
     }
 
-    int count = 0;
+    int armed = 0;
     if (g_runControl.IsSessionActive()) {
         if (!addresses.empty()) {
-            count = g_bpManager.SetFileBreakpoints(sourcePath,
+            armed = g_bpManager.SetFileBreakpoints(sourcePath,
                                                    addresses.data(),
                                                    static_cast<int>(addresses.size()),
                                                    amCODE);
@@ -684,13 +687,27 @@ void DapServer::HandleSetBreakpoints(int seq, const nlohmann::json& args)
         }
     }
 
+    // Check if a BP's address is in the armed list.
+    auto isArmed = [&](uint32_t addr) -> bool {
+        for (AG_BP* p = g_bpManager.HeadPtr() ? *g_bpManager.HeadPtr() : nullptr;
+             p; p = p->next) {
+            if (p->Adr == addr) return true;
+        }
+        return false;
+    };
+
     // Build the verified breakpoints response.
     for (size_t i = 0; i < addresses.size(); ++i) {
-        bool ok = (static_cast<int>(i) < count);
-        verified.push_back({
+        bool ok = g_runControl.IsSessionActive() && isArmed(addresses[i]);
+        nlohmann::json bpEntry = {
             {"verified", ok},
             {"id",       static_cast<int>(i + 1)},
-        });
+        };
+        if (!ok && g_runControl.IsSessionActive()) {
+            bpEntry["message"] = "Hardware limit: max " +
+                                 std::to_string(kMaxUserBreakpoints) + " breakpoints";
+        }
+        verified.push_back(bpEntry);
     }
 
     SendResponse(seq, "setBreakpoints", {{"breakpoints", verified}});
@@ -1401,11 +1418,8 @@ void DapServer::HandleScopes(int seq, const nlohmann::json& args)
     //   104 = IDATA memory
     nlohmann::json scopes = nlohmann::json::array();
 
-    // Only show Locals scope if we have local variable info for the current PC.
-    // TEMPORARILY DISABLED — VS Code fetches variables even when collapsed,
-    // causing unnecessary AG_MemAcc calls on every step. Re-enable once we
-    // have a lazy-load mechanism.
-#if 0
+    // Show Locals scope if we have local variable info for the current PC.
+    // expensive=true tells VS Code to collapse by default and only fetch on expand.
     if (g_symtab.IsLoaded()) {
         auto locals = g_symtab.LookupLocals(g_registers.PC());
         if (!locals.empty()) {
@@ -1413,7 +1427,6 @@ void DapServer::HandleScopes(int seq, const nlohmann::json& args)
                               {"variablesReference", 99}, {"expensive", true}});
         }
     }
-#endif
 
     // Registers scope removed — VS Code fetches it even when collapsed,
     // adding unnecessary overhead on every step.
@@ -1759,6 +1772,416 @@ void DapServer::HandleEvaluate(int seq, const nlohmann::json& args)
 
     SendResponse(seq, "evaluate", nlohmann::json(nullptr), false,
                  "Cannot evaluate: " + expr);
+}
+
+// ---------------------------------------------------------------------------
+// Parse a hex value string ("0xFF", "0x1234", "255", "42") into bytes.
+// Returns the number of bytes written (1–4), or 0 on failure.
+// Output is big-endian (MSB first) matching C51 memory layout.
+// ---------------------------------------------------------------------------
+static int ParseHexValue(const std::string& input, UC8 outBuf[4], int maxBytes)
+{
+    if (input.empty()) return 0;
+    uint32_t val = 0;
+    try {
+        if (input.size() > 2 && input[0] == '0' && (input[1] == 'x' || input[1] == 'X'))
+            val = static_cast<uint32_t>(std::stoul(input, nullptr, 16));
+        else
+            val = static_cast<uint32_t>(std::stoul(input, nullptr, 0));
+    } catch (...) { return 0; }
+
+    // Determine minimum byte width needed.
+    int needed = 1;
+    if (val > 0xFF)     needed = 2;
+    if (val > 0xFFFF)   needed = 3;
+    if (val > 0xFFFFFF) needed = 4;
+    int sz = (needed > maxBytes) ? maxBytes : needed;
+
+    // Store big-endian (C51 convention).
+    for (int i = 0; i < sz; ++i)
+        outBuf[i] = static_cast<UC8>((val >> (8 * (sz - 1 - i))) & 0xFF);
+    return sz;
+}
+
+// ---------------------------------------------------------------------------
+// Write a value to a memory-mapped variable/SFR via AG_MemAcc.
+// Returns true on success.
+// ---------------------------------------------------------------------------
+static bool WriteMemoryValue(uint16_t mSpace, uint32_t addr, const UC8* buf, uint8_t sz)
+{
+    if (!g_agdi.AG_MemAcc || sz == 0) return false;
+    GADR a{};
+    a.mSpace = mSpace;
+    a.Adr    = (static_cast<UL32>(mSpace) << 24) | (addr & 0xFFFF);
+    g_agdi.AG_MemAcc(AG_WRITE, const_cast<UC8*>(buf), &a, sz);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Read back a value after writing, formatted as hex string.
+// ---------------------------------------------------------------------------
+static std::string ReadBackHex(uint16_t mSpace, uint32_t addr, uint8_t sz)
+{
+    UC8 rdBuf[4] = {};
+    GADR a{};
+    a.mSpace = mSpace;
+    a.Adr    = (static_cast<UL32>(mSpace) << 24) | (addr & 0xFFFF);
+    g_agdi.AG_MemAcc(AG_READ, rdBuf, &a, sz);
+    char buf[12];
+    if (sz == 4)
+        _snprintf_s(buf, sizeof(buf), "0x%02X%02X%02X%02X", rdBuf[0], rdBuf[1], rdBuf[2], rdBuf[3]);
+    else if (sz == 2)
+        _snprintf_s(buf, sizeof(buf), "0x%02X%02X", rdBuf[0], rdBuf[1]);
+    else
+        _snprintf_s(buf, sizeof(buf), "0x%02X", rdBuf[0]);
+    return std::string(buf);
+}
+
+// ---------------------------------------------------------------------------
+// setVariable — edit a variable value in the Variables panel.
+// DAP args: { variablesReference, name, value }
+// ---------------------------------------------------------------------------
+void DapServer::HandleSetVariable(int seq, const nlohmann::json& args)
+{
+    int ref = args.value("variablesReference", 0);
+    std::string name  = args.value("name",  "");
+    std::string value = args.value("value", "");
+    LOG("[DAP]  setVariable ref=%d name=%s value=%s\n", ref, name.c_str(), value.c_str());
+
+    if (name.empty() || value.empty()) {
+        SendResponse(seq, "setVariable", nlohmann::json(nullptr), false, "missing name or value");
+        return;
+    }
+
+    // SFR address table (same as HandleEvaluate).
+    struct SfrInfo { const char* name; uint16_t addr; };
+    static const SfrInfo sfrs[] = {
+        {"ACC",  0xE0}, {"A",    0xE0}, {"B",    0xF0}, {"SP",   0x81},
+        {"PSW",  0xD0}, {"DPL",  0x82}, {"DPH",  0x83}, {"IE",   0xA8},
+        {"IP",   0xB8}, {"TCON", 0x88}, {"TMOD", 0x89}, {"P0",   0x80},
+        {"P1",   0x90}, {"P2",   0xA0}, {"P3",   0xB0}, {"SCON0",0x98},
+        {"SBUF0",0x99}, {"WDTCN",0x97}, {"PCON", 0x87},
+    };
+
+    std::string upper;
+    for (char c : name) upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+
+    // --- Registers scope (ref=100) ---
+    if (ref == 100) {
+        UC8 wrBuf[4] = {};
+
+        // PC
+        if (upper == "PC") {
+            if (!g_agdi.AG_RegAcc) {
+                SendResponse(seq, "setVariable", nlohmann::json(nullptr), false, "AGDI not loaded");
+                return;
+            }
+            int n = ParseHexValue(value, wrBuf, 2);
+            if (n == 0) {
+                SendResponse(seq, "setVariable", nlohmann::json(nullptr), false, "invalid value");
+                return;
+            }
+            GVAL gv{};
+            gv.u32 = (static_cast<uint32_t>(wrBuf[0]) << 8) | wrBuf[1];
+            if (n == 1) gv.u32 = wrBuf[0];
+            g_agdi.AG_RegAcc(AG_WRITE, 0x500, &gv);
+            // Read back.
+            GVAL rb{};
+            g_agdi.AG_RegAcc(AG_READ, 0x500, &rb);
+            char buf[12];
+            _snprintf_s(buf, sizeof(buf), "0x%04X", rb.u32 & 0xFFFF);
+            SendResponse(seq, "setVariable", {{"value", std::string(buf)}});
+            return;
+        }
+
+        // R0-R7
+        if (upper.size() == 2 && upper[0] == 'R' && upper[1] >= '0' && upper[1] <= '7') {
+            if (!g_agdi.AG_RegAcc) {
+                SendResponse(seq, "setVariable", nlohmann::json(nullptr), false, "AGDI not loaded");
+                return;
+            }
+            int idx = upper[1] - '0';
+            int n = ParseHexValue(value, wrBuf, 1);
+            if (n == 0) {
+                SendResponse(seq, "setVariable", nlohmann::json(nullptr), false, "invalid value");
+                return;
+            }
+            GVAL gv{};
+            gv.uc = wrBuf[0];
+            g_agdi.AG_RegAcc(AG_WRITE, idx, &gv);
+            // Read back.
+            GVAL rb{};
+            g_agdi.AG_RegAcc(AG_READ, idx, &rb);
+            char buf[8];
+            _snprintf_s(buf, sizeof(buf), "0x%02X", rb.uc);
+            SendResponse(seq, "setVariable", {{"value", std::string(buf)}});
+            return;
+        }
+
+        // SFRs (SP, ACC, B, PSW, DPL, DPH, etc.) — written via AG_MemAcc to DATA space.
+        for (const auto& sfr : sfrs) {
+            if (upper != sfr.name) continue;
+            int n = ParseHexValue(value, wrBuf, 1);
+            if (n == 0) {
+                SendResponse(seq, "setVariable", nlohmann::json(nullptr), false, "invalid value");
+                return;
+            }
+            WriteMemoryValue(amDATA, sfr.addr, wrBuf, 1);
+            std::string rb = ReadBackHex(amDATA, sfr.addr, 1);
+            SendResponse(seq, "setVariable", {{"value", rb}});
+            return;
+        }
+
+        SendResponse(seq, "setVariable", nlohmann::json(nullptr), false,
+                     "unknown register: " + name);
+        return;
+    }
+
+    // --- Locals scope (ref=99) ---
+    if (ref == 99 && g_symtab.IsLoaded()) {
+        auto lv = g_symtab.LookupLocalByName(name, g_registers.PC());
+        if (lv) {
+            uint8_t sz = lv->size;
+            if (sz < 1) sz = 1;
+            if (sz > 4) sz = 4;
+            UC8 wrBuf[4] = {};
+            int n = ParseHexValue(value, wrBuf, sz);
+            if (n == 0) {
+                SendResponse(seq, "setVariable", nlohmann::json(nullptr), false, "invalid value");
+                return;
+            }
+            // Pad to target size (MSB=0 for smaller input).
+            UC8 padded[4] = {};
+            int offset = sz - n;
+            for (int i = 0; i < n; ++i) padded[offset + i] = wrBuf[i];
+            WriteMemoryValue(lv->mSpace, lv->addr, padded, sz);
+            std::string rb = ReadBackHex(lv->mSpace, lv->addr, sz);
+            SendResponse(seq, "setVariable", {{"value", rb}});
+            return;
+        }
+    }
+
+    // --- Memory scopes (ref=101..104) ---
+    struct { int ref; U16 mSpace; } memScopes[] = {
+        {101, amCODE}, {102, amXDATA}, {103, amDATA}, {104, amIDATA},
+    };
+    for (auto& ms : memScopes) {
+        if (ref != ms.ref) continue;
+        // name is the hex address string "0xNNNN".
+        uint32_t addr = 0;
+        try { addr = static_cast<uint32_t>(std::stoul(name, nullptr, 16)); }
+        catch (...) {
+            SendResponse(seq, "setVariable", nlohmann::json(nullptr), false, "invalid address");
+            return;
+        }
+        UC8 wrBuf[4] = {};
+        int n = ParseHexValue(value, wrBuf, 1);
+        if (n == 0) {
+            SendResponse(seq, "setVariable", nlohmann::json(nullptr), false, "invalid value");
+            return;
+        }
+        WriteMemoryValue(ms.mSpace, addr, wrBuf, 1);
+        std::string rb = ReadBackHex(ms.mSpace, addr, 1);
+        SendResponse(seq, "setVariable", {{"value", rb}});
+        return;
+    }
+
+    SendResponse(seq, "setVariable", nlohmann::json(nullptr), false,
+                 "cannot set variable: " + name);
+}
+
+// ---------------------------------------------------------------------------
+// setExpression — edit a watch expression value.
+// DAP args: { expression, value, frameId? }
+// Resolves the expression the same way HandleEvaluate does, then writes.
+// ---------------------------------------------------------------------------
+void DapServer::HandleSetExpression(int seq, const nlohmann::json& args)
+{
+    std::string expr  = args.value("expression", "");
+    std::string value = args.value("value", "");
+    LOG("[DAP]  setExpression expr=%s value=%s\n", expr.c_str(), value.c_str());
+
+    if (expr.empty() || value.empty()) {
+        SendResponse(seq, "setExpression", nlohmann::json(nullptr), false, "missing expression or value");
+        return;
+    }
+
+    std::string upper;
+    for (char c : expr) upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+
+    struct SfrInfo { const char* name; uint16_t addr; };
+    static const SfrInfo sfrs[] = {
+        {"ACC",  0xE0}, {"A",    0xE0}, {"B",    0xF0}, {"SP",   0x81},
+        {"PSW",  0xD0}, {"DPL",  0x82}, {"DPH",  0x83}, {"IE",   0xA8},
+        {"IP",   0xB8}, {"TCON", 0x88}, {"TMOD", 0x89}, {"P0",   0x80},
+        {"P1",   0x90}, {"P2",   0xA0}, {"P3",   0xB0}, {"SCON0",0x98},
+        {"SBUF0",0x99}, {"WDTCN",0x97}, {"PCON", 0x87},
+    };
+
+    UC8 wrBuf[4] = {};
+
+    // PC
+    if (upper == "PC" && g_agdi.AG_RegAcc) {
+        int n = ParseHexValue(value, wrBuf, 2);
+        if (n == 0) { SendResponse(seq, "setExpression", nlohmann::json(nullptr), false, "invalid value"); return; }
+        GVAL gv{};
+        gv.u32 = (n == 1) ? wrBuf[0] : ((static_cast<uint32_t>(wrBuf[0]) << 8) | wrBuf[1]);
+        g_agdi.AG_RegAcc(AG_WRITE, 0x500, &gv);
+        GVAL rb{};
+        g_agdi.AG_RegAcc(AG_READ, 0x500, &rb);
+        char buf[12]; _snprintf_s(buf, sizeof(buf), "0x%04X", rb.u32 & 0xFFFF);
+        SendResponse(seq, "setExpression", {{"value", std::string(buf)}});
+        return;
+    }
+
+    // R0-R7
+    if (upper.size() == 2 && upper[0] == 'R' && upper[1] >= '0' && upper[1] <= '7' && g_agdi.AG_RegAcc) {
+        int idx = upper[1] - '0';
+        int n = ParseHexValue(value, wrBuf, 1);
+        if (n == 0) { SendResponse(seq, "setExpression", nlohmann::json(nullptr), false, "invalid value"); return; }
+        GVAL gv{}; gv.uc = wrBuf[0];
+        g_agdi.AG_RegAcc(AG_WRITE, idx, &gv);
+        GVAL rb{}; g_agdi.AG_RegAcc(AG_READ, idx, &rb);
+        char buf[8]; _snprintf_s(buf, sizeof(buf), "0x%02X", rb.uc);
+        SendResponse(seq, "setExpression", {{"value", std::string(buf)}});
+        return;
+    }
+
+    // DPTR (16-bit: DPH:DPL)
+    if (upper == "DPTR" && g_agdi.AG_MemAcc) {
+        int n = ParseHexValue(value, wrBuf, 2);
+        if (n == 0) { SendResponse(seq, "setExpression", nlohmann::json(nullptr), false, "invalid value"); return; }
+        uint16_t dptr = (n == 1) ? wrBuf[0] : ((static_cast<uint16_t>(wrBuf[0]) << 8) | wrBuf[1]);
+        UC8 dpl = static_cast<UC8>(dptr & 0xFF);
+        UC8 dph = static_cast<UC8>((dptr >> 8) & 0xFF);
+        WriteMemoryValue(amDATA, 0x82, &dpl, 1);
+        WriteMemoryValue(amDATA, 0x83, &dph, 1);
+        std::string rb = ReadBackHex(amDATA, 0x82, 1);
+        std::string rbh = ReadBackHex(amDATA, 0x83, 1);
+        // Reconstruct DPTR display.
+        UC8 rdl[4]={}, rdh[4]={};
+        GADR a{}; a.mSpace = amDATA;
+        a.Adr = (static_cast<UL32>(amDATA) << 24) | 0x82; g_agdi.AG_MemAcc(AG_READ, rdl, &a, 1);
+        a.Adr = (static_cast<UL32>(amDATA) << 24) | 0x83; g_agdi.AG_MemAcc(AG_READ, rdh, &a, 1);
+        char buf[8]; _snprintf_s(buf, sizeof(buf), "0x%04X", (static_cast<uint16_t>(rdh[0]) << 8) | rdl[0]);
+        SendResponse(seq, "setExpression", {{"value", std::string(buf)}});
+        return;
+    }
+
+    // SFRs
+    for (const auto& sfr : sfrs) {
+        if (upper != sfr.name) continue;
+        int n = ParseHexValue(value, wrBuf, 1);
+        if (n == 0) { SendResponse(seq, "setExpression", nlohmann::json(nullptr), false, "invalid value"); return; }
+        WriteMemoryValue(amDATA, sfr.addr, wrBuf, 1);
+        std::string rb = ReadBackHex(amDATA, sfr.addr, 1);
+        SendResponse(seq, "setExpression", {{"value", rb}});
+        return;
+    }
+
+    // Local variable
+    if (g_symtab.IsLoaded() && g_agdi.AG_MemAcc) {
+        auto lv = g_symtab.LookupLocalByName(expr, g_registers.PC());
+        if (lv) {
+            uint8_t sz = lv->size;
+            if (sz < 1) sz = 1;
+            if (sz > 4) sz = 4;
+            int n = ParseHexValue(value, wrBuf, sz);
+            if (n == 0) { SendResponse(seq, "setExpression", nlohmann::json(nullptr), false, "invalid value"); return; }
+            UC8 padded[4] = {};
+            int offset = sz - n;
+            for (int i = 0; i < n; ++i) padded[offset + i] = wrBuf[i];
+            WriteMemoryValue(lv->mSpace, lv->addr, padded, sz);
+            std::string rb = ReadBackHex(lv->mSpace, lv->addr, sz);
+            SendResponse(seq, "setExpression", {{"value", rb}});
+            return;
+        }
+    }
+
+    // Global variable
+    if (g_symtab.IsLoaded() && g_agdi.AG_MemAcc) {
+        auto gv = g_symtab.LookupGlobalByName(expr);
+        if (gv) {
+            uint8_t sz = gv->size;
+            if (sz < 1) sz = 1;
+            if (sz > 4) sz = 4;
+            int n = ParseHexValue(value, wrBuf, sz);
+            if (n == 0) { SendResponse(seq, "setExpression", nlohmann::json(nullptr), false, "invalid value"); return; }
+            UC8 padded[4] = {};
+            int offset = sz - n;
+            for (int i = 0; i < n; ++i) padded[offset + i] = wrBuf[i];
+            WriteMemoryValue(gv->mSpace, gv->addr, padded, sz);
+            std::string rb = ReadBackHex(gv->mSpace, gv->addr, sz);
+            SendResponse(seq, "setExpression", {{"value", rb}});
+            return;
+        }
+    }
+
+    SendResponse(seq, "setExpression", nlohmann::json(nullptr), false,
+                 "cannot set: " + expr);
+}
+
+// ---------------------------------------------------------------------------
+// writeMemory \u2014 write bytes to target memory (hex Memory Inspector editing).
+// DAP args: { memoryReference, offset?, data (base64) }
+// ---------------------------------------------------------------------------
+void DapServer::HandleWriteMemory(int seq, const nlohmann::json& args)
+{
+    if (!args.contains("memoryReference") || !args.contains("data")) {
+        SendResponse(seq, "writeMemory", nlohmann::json(nullptr), false, "missing parameters");
+        return;
+    }
+
+    uint32_t memRef = static_cast<uint32_t>(
+        std::stoul(args["memoryReference"].get<std::string>(), nullptr, 0));
+    int offset = args.value("offset", 0);
+    std::string b64data = args["data"].get<std::string>();
+
+    // Decode base64.
+    auto b64val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    std::vector<UC8> decoded;
+    decoded.reserve(b64data.size() * 3 / 4);
+    for (size_t i = 0; i + 3 < b64data.size(); i += 4) {
+        int a = b64val(b64data[i]), b = b64val(b64data[i+1]);
+        int c = b64val(b64data[i+2]), d = b64val(b64data[i+3]);
+        if (a < 0 || b < 0) break;
+        decoded.push_back(static_cast<UC8>((a << 2) | (b >> 4)));
+        if (c >= 0) decoded.push_back(static_cast<UC8>(((b & 0xF) << 4) | (c >> 2)));
+        if (d >= 0) decoded.push_back(static_cast<UC8>(((c & 0x3) << 6) | d));
+    }
+
+    if (decoded.empty()) {
+        SendResponse(seq, "writeMemory", nlohmann::json(nullptr), false, "empty data");
+        return;
+    }
+
+    uint32_t baseAddr = (memRef & 0x00FFFFFF) + static_cast<uint32_t>(offset);
+    U16 mSpace = static_cast<U16>((memRef >> 24) & 0xFF);
+
+    LOG("[DAP]  writeMemory mSpace=0x%04X addr=0x%04X count=%zu\n",
+        mSpace, baseAddr & 0xFFFF, decoded.size());
+
+    if (!g_agdi.AG_MemAcc) {
+        SendResponse(seq, "writeMemory", nlohmann::json(nullptr), false, "AGDI not loaded");
+        return;
+    }
+
+    GADR addr{};
+    addr.Adr    = (static_cast<UL32>(mSpace) << 24) | (baseAddr & 0xFFFF);
+    addr.nLen   = static_cast<UL32>(decoded.size());
+    addr.mSpace = mSpace;
+    g_agdi.AG_MemAcc(AG_WRITE, decoded.data(), &addr, static_cast<UL32>(decoded.size()));
+
+    SendResponse(seq, "writeMemory", {
+        {"bytesWritten", static_cast<int>(decoded.size())},
+    });
 }
 
 void DapServer::HandleSource(int seq, const nlohmann::json& args)

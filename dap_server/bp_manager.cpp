@@ -32,23 +32,32 @@ int BpManager::SetFileBreakpoints(const std::string& sourcePath,
     }
 
     // Rebuild the full DLL breakpoint list from all files.
-    RebuildDllBreakpoints(mSpace);
+    int armed = RebuildDllBreakpoints(mSpace);
 
-    return count;
+    // Return count for this file only: how many of this file's BPs were armed.
+    // Since rebuild processes files in map order, count how many of the armed
+    // BPs belong to this file.
+    int thisFileArmed = 0;
+    for (AG_BP* p = m_head; p; p = p->next) {
+        for (int i = 0; i < count; ++i) {
+            if (p->Adr == addresses[i]) { ++thisFileArmed; break; }
+        }
+    }
+    return thisFileArmed;
 }
 
-void BpManager::RebuildDllBreakpoints(uint16_t mSpace)
+int BpManager::RebuildDllBreakpoints(uint16_t mSpace)
 {
     // Kill all existing DLL breakpoints.
     ClearAll();
 
-    // Collect all addresses from all files.
+    // Collect all addresses from all files, up to kMaxUserBreakpoints.
     AG_BP* tail = nullptr;
     int total = 0;
 
     for (const auto& entry : m_fileBreakpoints) {
         for (uint32_t addr : entry.second) {
-            if (total >= kMaxBreakpoints) break;
+            if (total >= kMaxUserBreakpoints) break;
 
             AG_BP* bp = Alloc();
             if (!bp) break;
@@ -79,14 +88,16 @@ void BpManager::RebuildDllBreakpoints(uint16_t mSpace)
         }
     }
 
-    LOG("[BP]   RebuildDllBreakpoints: %d breakpoints armed across %zu files\n",
-        total, m_fileBreakpoints.size());
+    LOG("[BP]   RebuildDllBreakpoints: %d/%d breakpoints armed across %zu files\n",
+        total, kMaxUserBreakpoints, m_fileBreakpoints.size());
 
     // Dump the BP linked list for diagnostics.
     for (AG_BP* p = m_head; p; p = p->next) {
         LOG("[BP]     list: Adr=0x%04X type=%u enabled=%u mSpace=0x%04X\n",
             p->Adr, p->type, p->enabled, p->mSpace);
     }
+
+    return total;
 }
 
 void BpManager::ClearAll()
@@ -201,4 +212,12 @@ void BpManager::RemoveTempBreakpoint(AG_BP* bp)
 
     LOG("[BP]   TempBP removed at 0x%04X\n", bp->Adr);
     Free(bp);
+}
+
+int BpManager::TotalUserBreakpoints() const
+{
+    int total = 0;
+    for (const auto& entry : m_fileBreakpoints)
+        total += static_cast<int>(entry.second.size());
+    return total;
 }

@@ -1,7 +1,7 @@
 # DAP Implementation Status
 
-**Last updated:** April 19, 2026  
-**Server version:** v0.12.0  
+**Last updated:** April 20, 2026  
+**Server version:** v0.13.0  
 **Reference:** Microsoft vscode-mock-debug (`dap_ref/vscode-mock-debug/`)
 
 ---
@@ -32,14 +32,16 @@ and the mock-debug reference implementation.
 | `scopes` | `HandleScopes` | No | 6 scopes: Locals (conditional), Registers, CODE, XDATA, DATA, IDATA |
 | `variables` | `HandleVariables` | No | Locals from m51 PROC info; Registers from RG51; memory from `AG_MemAcc` (256 bytes per scope) |
 | `readMemory` | `HandleReadMemory` | No | Encoded `mSpace<<24 \| addr`; base64 response |
-| `evaluate` | `HandleEvaluate` | No | Local variables, SFR names, register names, DPTR, hex addresses, PUBLIC symbols |
+| `writeMemory` | `HandleWriteMemory` | No | Base64 decode → `AG_MemAcc(AG_WRITE)`; returns bytesWritten |
+| `setVariable` | `HandleSetVariable` | No | Registers via `AG_RegAcc`, SFRs/locals/memory via `AG_MemAcc(AG_WRITE)` |
+| `setExpression` | `HandleSetExpression` | No | Same resolution as `evaluate`, then writes value |
+| `evaluate` | `HandleEvaluate` | No | Local variables, SFR names, register names, DPTR, hex addresses, PUBLIC symbols, `SPACE:ADDR` memory references |
 | `source` | `HandleSource` | No | Returns source file content for files without a local path |
 
 ### Not Implemented (fallback returns `success:false`)
 
 | DAP Command | Priority | Needed? | Notes |
 |---|---|---|---|
-| `setVariable` | Medium | Nice-to-have | Would allow editing register/memory values from the Variables panel. |
 | `disassemble` | Medium | Nice-to-have | Would enable the Disassembly view. Requires 8051 instruction decoder. |
 | `setFunctionBreakpoints` | Low | No | We have no function-name→address resolution that can't already be done via source BPs. |
 | `setInstructionBreakpoints` | Low | No | For disassembly-view BPs. Requires `disassemble` first. |
@@ -48,7 +50,6 @@ and the mock-debug reference implementation.
 | `completions` | Low | No | REPL auto-complete. |
 | `modules` | Low | No | Single-module MCU; no dynamic loading. |
 | `loadedSources` | Low | No | Would list all source files; nice but not critical. |
-| `writeMemory` | Low | Nice-to-have | Would enable memory editing in the Memory view. |
 | `goto` / `gotoTargets` | Low | No | Set-next-statement. AGDI supports it but low priority. |
 
 ---
@@ -67,7 +68,11 @@ From `MakeCapabilities()` in `dap_types.h`:
 | `supportsStepOutRequest` | `true` | RET/RETI scan + tail-call LJMP/AJMP exit detection |
 | `supportsPauseRequest` | `true` | |
 | `supportsDisconnectRequest` | `true` | |
+| `supportsMemoryReferences` | `true` | Enables Memory Inspector integration |
 | `supportsReadMemoryRequest` | `true` | |
+| `supportsWriteMemoryRequest` | `true` | |
+| `supportsSetVariable` | `true` | Edit registers/SFRs/locals/memory from Variables panel |
+| `supportsSetExpression` | `true` | Edit watch expressions |
 | `supportsEvaluateForHovers` | `true` | Local vars, SFRs, registers, symbols |
 | `supportsSteppingGranularity` | `true` | `statement` (source-line loop) or `instruction` (single opcode) |
 | `supportsTerminateRequest` | `false` | Aliased internally to disconnect |
@@ -78,8 +83,6 @@ From `MakeCapabilities()` in `dap_types.h`:
 | Capability | Why |
 |---|---|
 | `supportsValueFormattingOptions` | `true` — we already format hex; could support decimal toggle |
-| `supportsSetVariable` | Enable editing variables/registers from the Variables panel |
-| `supportsSetExpression` | Enable editing watch expressions |
 
 ### Capabilities We Don't Need (mock-debug has, we skip)
 
@@ -127,6 +130,13 @@ From `MakeCapabilities()` in `dap_types.h`:
 - **Launch properties:** `program` (required), `noDebug`, `noErase`
 - **Snippets:** 3 (Debug, Flash Only, Flash no-erase)
 - **Breakpoints contribution:** `c`, `a51` — gutter dots shown for C and assembly files
+- **Custom debug views:** 5 collapsible panels in the Debug sidebar:
+  - **Registers** — R0–R7, ACC, B, SP, DPTR, PSW, PC (from `variablesReference=100`)
+  - **DATA** — 256 bytes of DATA memory (from `variablesReference=103`)
+  - **XDATA** — 256 bytes of XDATA memory (from `variablesReference=102`)
+  - **IDATA** — 256 bytes of IDATA memory (from `variablesReference=104`)
+  - **CODE** — 256 bytes of CODE flash (from `variablesReference=101`)
+- **Auto-refresh:** Views refresh on every `stopped` event via `DebugAdapterTracker`
 
 ### Missing vs. Mock-Debug Reference
 
@@ -176,28 +186,22 @@ No open bugs.
 
 ### High (Core Debug Quality)
 
-- [ ] **Implement `setVariable`** — Enable editing register/memory values from the
-      Variables panel using `AG_RegAcc` (registers) and `AG_MemAcc(AG_WRITE)` (memory).
-- [ ] **Fix WaitAndSendStopped race** — When a new run-control command is issued
-      while a previous `WaitAndSendStopped` thread is active, the old thread should
-      be cancelled to prevent duplicate `stopped` events.
+No high-priority items remaining.
 
 ### Medium (Feature Improvements)
 
-- [ ] **Improve stepping speed** — Source-level step-over is sluggish due to per-instruction
-      USB round-trips. Investigate batching or smarter `AG_GOTILADR` usage for straight-line
-      code paths.
 - [ ] **Add `disassemble` handler** — Use `opcodes8051.h` + a basic 8051 disassembler.
-- [ ] **Add `writeMemory` handler** — Mirror `readMemory` but with `AG_MemAcc(AG_WRITE)`.
 - [ ] **Add `DebugConfigurationProvider` to extension** — Auto-fill launch config
       when no `launch.json` exists.
 
 ### Low (Polish)
 
-- [ ] **Memory view chunking** — Support paging via `readMemory` with arbitrary offset/count.
 - [ ] **Progress events** — Send `progressStart`/`progressUpdate`/`progressEnd` during
       flash operations.
 - [ ] **Breakpoint validation** — Send `breakpoint` events when BPs are set/cleared.
+- [ ] **Memory Inspector integration** — VS Code's built-in Memory Inspector not yet
+      appearing despite `supportsMemoryReferences`/`supportsReadMemoryRequest`. May
+      require Hex Editor extension or additional DAP plumbing.
 
 ---
 

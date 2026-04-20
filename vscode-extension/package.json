@@ -22,6 +22,15 @@
   "activationEvents": ["onDebugResolve:silabs8051"],
   "main": "./extension.js",
   "contributes": {
+    "views": {
+      "debug": [
+        { "id": "silabs8051.registers", "name": "Registers" },
+        { "id": "silabs8051.data",      "name": "DATA" },
+        { "id": "silabs8051.xdata",     "name": "XDATA" },
+        { "id": "silabs8051.idata",     "name": "IDATA" },
+        { "id": "silabs8051.code",      "name": "CODE" }
+      ]
+    },
     "breakpoints": [
       { "language": "c" },
       { "language": "a51" }

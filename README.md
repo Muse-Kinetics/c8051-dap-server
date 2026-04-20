@@ -152,8 +152,11 @@ VSCode connects to `127.0.0.1:4711` automatically. The DAP server erases/program
 | `stackTrace` | Shadow call stack with full call chain across step operations |
 | `scopes` | Locals, Registers, CODE, XDATA, DATA, IDATA scopes |
 | `variables` | Local C variables, register values, or raw memory page dump |
-| `evaluate` | Watch/hover: local vars, SFR names, registers, DPTR, hex addresses |
+| `evaluate` | Watch/hover: local vars, SFR names, registers, DPTR, hex addresses, `SPACE:ADDR` refs |
+| `setVariable` | Edit register, SFR, local variable, or memory value directly from Variables panel |
+| `setExpression` | Edit watch expressions — same resolution as evaluate, then writes to hardware |
 | `readMemory` | `memoryReference = memSpace<<24 \| address` |
+| `writeMemory` | Base64 payload → `AG_MemAcc(AG_WRITE)` |
 | `continue` | Run to next breakpoint (WDT auto-disabled) |
 | `next` | Step over (NSTEP loop with CALL detection + AG_GOTILADR for return address) |
 | `stepIn` | Step into (NSTEP loop until source line changes; enters CALLs) |

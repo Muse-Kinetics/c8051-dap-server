@@ -82,6 +82,9 @@ private:
     void HandleVariables       (int seq, const nlohmann::json& args);
     void HandleReadMemory      (int seq, const nlohmann::json& args);
     void HandleEvaluate        (int seq, const nlohmann::json& args);
+    void HandleSetVariable     (int seq, const nlohmann::json& args);
+    void HandleSetExpression   (int seq, const nlohmann::json& args);
+    void HandleWriteMemory     (int seq, const nlohmann::json& args);
     void HandleSource          (int seq, const nlohmann::json& args);
 
     int  m_port;

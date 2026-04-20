@@ -127,6 +127,20 @@ and change the `program` path to point to your built HEX file.
 | `noDebug` | `false` | `true` → flash-only mode, no debug session. |
 | `noErase` | `false` | `true` → skip erase pass (program+verify only). |
 
+## Debug features
+
+| Feature | Notes |
+|---------|-------|
+| Breakpoints | Source-line and address breakpoints; max 4 active (hardware limit) |
+| Step over / into / out | Source-level; also supports instruction granularity |
+| Pause | Halts a running target |
+| Variables / Locals | Local variables from debug info, auto-displayed on halt |
+| Registers | R0–R7, ACC, B, SP, DPTR, PSW, PC — visible in **Registers** panel |
+| Edit values | Right-click any variable or watch expression → **Set Value** to write to hardware |
+| Watch expressions | SFR names (`ACC`, `PSW`, …), register names, local names, hex addresses |
+| DATA / XDATA / IDATA / CODE panels | 256-byte memory dumps in the Debug sidebar, auto-refresh on halt |
+| Read memory | `DATA:0xNN`, `XDATA:0xNNNN`, `CODE:0xNNNN`, `IDATA:0xNN` in Watch |
+
 ## Files in this folder
 
 | File/Folder | Description |
