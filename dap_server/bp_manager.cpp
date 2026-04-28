@@ -18,6 +18,7 @@ void BpManager::Init()
     std::memset(m_pool, 0, sizeof(m_pool));
     m_head = nullptr;
     m_fileBreakpoints.clear();
+    m_instrBreakpoints.clear();
 }
 
 int BpManager::SetFileBreakpoints(const std::string& sourcePath,
@@ -51,53 +52,86 @@ int BpManager::RebuildDllBreakpoints(uint16_t mSpace)
     // Kill all existing DLL breakpoints.
     ClearAll();
 
-    // Collect all addresses from all files, up to kMaxUserBreakpoints.
-    AG_BP* tail = nullptr;
-    int total = 0;
+    AG_BP* tail  = nullptr;
+    int    total = 0;
 
-    for (const auto& entry : m_fileBreakpoints) {
-        for (uint32_t addr : entry.second) {
-            if (total >= kMaxUserBreakpoints) break;
+    // Dedup tracker — instruction BPs may coincide with file/line BPs.
+    uint32_t armed[kMaxUserBreakpoints];
+    int      nArmed = 0;
 
-            AG_BP* bp = Alloc();
-            if (!bp) break;
+    static char empty[] = "";
 
-            bp->type    = AG_ABREAK;
-            bp->enabled = 1;
-            bp->Adr     = addr;
-            bp->mSpace  = mSpace;
-            bp->number  = static_cast<UL32>(total + 1);
+    auto TryArm = [&](uint32_t addr) {
+        if (total >= kMaxUserBreakpoints) return;
+        // Skip duplicates.
+        for (int k = 0; k < nArmed; ++k)
+            if (armed[k] == addr) return;
 
-            // The DLL may dereference char* fields — point to empty strings.
-            static char empty[] = "";
-            bp->pF   = empty;
-            bp->cmd  = empty;
-            bp->Line = empty;
+        AG_BP* bp = Alloc();
+        if (!bp) return;
 
-            // Link into the list.
-            if (!m_head) {
-                m_head = bp;
-            } else {
-                tail->next = bp;
-                bp->prev   = tail;
-            }
-            tail = bp;
+        bp->type    = AG_ABREAK;
+        bp->enabled = 1;
+        bp->Adr     = addr;
+        bp->mSpace  = mSpace;
+        bp->number  = static_cast<UL32>(total + 1);
+        bp->pF      = empty;
+        bp->cmd     = empty;
+        bp->Line    = empty;
 
-            NotifyDll(bp, AG_BPSET);
-            ++total;
+        if (!m_head) {
+            m_head = bp;
+        } else {
+            tail->next = bp;
+            bp->prev   = tail;
         }
-    }
+        tail = bp;
 
-    LOG("[BP]   RebuildDllBreakpoints: %d/%d breakpoints armed across %zu files\n",
-        total, kMaxUserBreakpoints, m_fileBreakpoints.size());
+        NotifyDll(bp, AG_BPSET);
+        armed[nArmed++] = addr;
+        ++total;
+    };
 
-    // Dump the BP linked list for diagnostics.
+    // File breakpoints first (they were set before instruction BPs).
+    for (const auto& entry : m_fileBreakpoints)
+        for (uint32_t addr : entry.second)
+            TryArm(addr);
+
+    // Instruction breakpoints share the same pool.
+    for (uint32_t addr : m_instrBreakpoints)
+        TryArm(addr);
+
+    LOG("[BP]   RebuildDllBreakpoints: %d/%d armed (%zu file, %zu instr)\n",
+        total, kMaxUserBreakpoints,
+        m_fileBreakpoints.size(), m_instrBreakpoints.size());
+
     for (AG_BP* p = m_head; p; p = p->next) {
         LOG("[BP]     list: Adr=0x%04X type=%u enabled=%u mSpace=0x%04X\n",
             p->Adr, p->type, p->enabled, p->mSpace);
     }
 
     return total;
+}
+
+int BpManager::SetInstructionBreakpoints(const uint32_t* addresses, int count,
+                                          uint16_t mSpace)
+{
+    if (count <= 0 || !addresses) {
+        m_instrBreakpoints.clear();
+    } else {
+        m_instrBreakpoints.assign(addresses, addresses + count);
+    }
+
+    RebuildDllBreakpoints(mSpace);
+
+    // Count how many of the requested instruction BPs were actually armed.
+    int armed = 0;
+    for (AG_BP* p = m_head; p; p = p->next) {
+        for (uint32_t addr : m_instrBreakpoints) {
+            if (p->Adr == addr) { ++armed; break; }
+        }
+    }
+    return armed;
 }
 
 void BpManager::ClearAll()

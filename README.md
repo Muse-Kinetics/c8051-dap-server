@@ -1,7 +1,12 @@
 # C8051 DAP Server
 
+**GitHub:** https://github.com/Muse-Kinetics/c8051-dap-server  
+**License:** MIT  
+**Author:** Eric Bateman — [KMI Music, Inc.](https://www.kmimusic.com)
+
 A Windows DAP (Debug Adapter Protocol) server that enables **VSCode to debug and flash
-Silicon Laboratories C8051F-series MCUs** via an EC3 USB Debug Adapter.
+Silicon Laboratories C8051F-series MCUs** via the
+[Silicon Labs 8-Bit USB Debug Adapter](https://www.silabs.com/development-tools/mcu/8-bit/8-bit-usb-debug-adapter?tab=overview).
 
 It drives the proprietary `SiC8051F.dll` (AGDI) that ships with Keil µVision, exposing
 it as a standard Microsoft DAP server over TCP port 4711. A small VSCode extension
@@ -9,11 +14,58 @@ connects to it automatically when you press F5.
 
 ---
 
+## Quick Start (Pre-built VSIX)
+
+The easiest way to use this tool is to install the pre-built VSIX from the
+[GitHub Releases page](https://github.com/Muse-Kinetics/c8051-dap-server/releases).
+
+> **Want to build the VSIX yourself?** See [CONTRIBUTING.md](CONTRIBUTING.md#building-the-vsix) — no Node.js or `vsce` required.
+
+1. Download `silabs-8051-debug-<version>.vsix`
+2. In VSCode: **Extensions** (`Ctrl+Shift+X`) → `...` menu → **Install from VSIX…**
+3. On first use, the extension will automatically locate your Keil installation and
+   copy the required adapter DLLs (`SiC8051F.dll`, `USBHID.dll`) into its `bin\` folder
+4. Open your firmware project, add a launch configuration (see below), and press **F5**
+
+### Add a launch configuration
+
+Open `.vscode/launch.json` and click **Add Configuration…** at the bottom-right, or
+paste this template and update `uvprojFile`:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "silabs8051",
+      "request": "launch",
+      "name": "Debug",
+      "uvprojFile": "${workspaceFolder}/YourProject.uvproj",
+      "buildBeforeDebug": true,
+      "preLaunchTask": "Ensure DAP Server"
+    },
+    {
+      "type": "silabs8051",
+      "request": "launch",
+      "name": "Flash + Verify",
+      "uvprojFile": "${workspaceFolder}/YourProject.uvproj",
+      "buildBeforeDebug": true,
+      "noDebug": true
+    }
+  ]
+}
+```
+
+> **Prerequisites:** [Keil µVision](https://www.keil.com/download/product/) with the
+> C51 toolchain installed. The extension auto-detects it via the Windows registry.
+
+---
+
 ## Hardware Requirements
 
-- Silicon Laboratories **EC3 USB Debug Adapter**
+- Silicon Laboratories [**8-Bit USB Debug Adapter**](https://www.silabs.com/development-tools/mcu/8-bit/8-bit-usb-debug-adapter?tab=overview) (USB to C2/JTAG bridge)
 - Target board with a **C8051F-series MCU** (tested: C8051F380 / EFM8UB20F64G)
-- EC3 debug header connected to the board
+- Debug header connected to the board
 
 ## Software Requirements
 
@@ -68,7 +120,7 @@ directory automatically.
 .\scripts\install_extension.ps1
 ```
 
-Creates a junction from `~/.vscode/extensions/local.silabs-8051-debug-0.10.0` to
+Creates a junction from `~/.vscode/extensions/local.silabs-8051-debug-0.13.0` to
 `vscode-extension\`. Reload VSCode afterwards (`Ctrl+Shift+P` → `Developer: Reload Window`).
 
 ---
@@ -86,7 +138,8 @@ Verbose log (DLL internals) is written to `dap_server.log`.
 
 ### 2. Add a launch configuration to your firmware project
 
-Create `.vscode\launch.json` in your firmware project folder:
+Create `.vscode\launch.json` in your firmware project folder (or use **Add Configuration…**
+in the VSCode launch.json editor):
 
 ```json
 {
@@ -96,13 +149,16 @@ Create `.vscode\launch.json` in your firmware project folder:
       "type": "silabs8051",
       "request": "launch",
       "name": "Debug",
-      "program": "${workspaceFolder}/output/firmware.hex"
+      "uvprojFile": "${workspaceFolder}/YourProject.uvproj",
+      "buildBeforeDebug": true,
+      "preLaunchTask": "Ensure DAP Server"
     },
     {
       "type": "silabs8051",
       "request": "launch",
       "name": "Flash (no erase)",
-      "program": "${workspaceFolder}/output/firmware.hex",
+      "uvprojFile": "${workspaceFolder}/YourProject.uvproj",
+      "buildBeforeDebug": true,
       "noDebug": true,
       "noErase": true
     },
@@ -110,7 +166,8 @@ Create `.vscode\launch.json` in your firmware project folder:
       "type": "silabs8051",
       "request": "launch",
       "name": "Flash (full erase)",
-      "program": "${workspaceFolder}/output/firmware.hex",
+      "uvprojFile": "${workspaceFolder}/YourProject.uvproj",
+      "buildBeforeDebug": true,
       "noDebug": true
     }
   ]
@@ -134,7 +191,10 @@ VSCode connects to `127.0.0.1:4711` automatically. The DAP server erases/program
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `program` | string | — | **Required.** Path to the Intel HEX file. |
+| `uvprojFile` | string | *(auto-detect)* | Path to the Keil µVision project file (`.uvproj` / `.uvprojx`). Supports `${workspaceFolder}`. |
+| `program` | string | *(from uvproj)* | Path to the Intel HEX file. Derived from the project file if omitted. |
+| `buildBeforeDebug` | boolean | `false` | `true` → invoke `UV4.exe -b` to build before launching. |
+| `buildTarget` | string | *(from .uvopt)* | µVision target name passed as `-t <name>` to UV4.exe. If omitted, UV4 builds whichever target was last active in the project. |
 | `noDebug` | boolean | `false` | `true` → flash-only (no debug session). |
 | `noErase` | boolean | `false` | `true` → skip erase pass (program+verify only, faster). |
 
@@ -190,11 +250,11 @@ pip install -r requirements.txt
 Run `.\scripts\install_extension.ps1` and reload VSCode.
 
 **"INITFEATURES returned 1" / target not connected**
-Check EC3 USB is plugged in and the debug header is seated. Restart the server.
+Check the USB Debug Adapter is plugged in and the debug header is seated. Restart the server.
 
 **Device doesn't run after `continue`**
 The WDT disable sequence is applied automatically. If the device still doesn't run,
-check EC3 connection and restart the server.
+check the USB Debug Adapter connection and restart the server.
 
 **Can't reconnect after VSCode crash**
 The server automatically cleans up if VSCode drops the TCP connection without

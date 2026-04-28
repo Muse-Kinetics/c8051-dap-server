@@ -36,15 +36,15 @@ and the mock-debug reference implementation.
 | `setVariable` | `HandleSetVariable` | No | Registers via `AG_RegAcc`, SFRs/locals/memory via `AG_MemAcc(AG_WRITE)` |
 | `setExpression` | `HandleSetExpression` | No | Same resolution as `evaluate`, then writes value |
 | `evaluate` | `HandleEvaluate` | No | Local variables, SFR names, register names, DPTR, hex addresses, PUBLIC symbols, `SPACE:ADDR` memory references |
+| `disassemble` | `HandleDisassemble` | No | Reads CODE memory, decodes all 256 8051 opcodes including AJMP/ACALL 11-bit addressing, relative branches, bit addressing; attaches source location from symtab; supports `instructionOffset` (negative = context above current PC) |
+| `setInstructionBreakpoints` | `HandleSetInstructionBreakpoints` | No | Address-only BPs from disassembly view; share the 4-slot hardware pool with file BPs (file BPs armed first); deduplication across both sets |
 | `source` | `HandleSource` | No | Returns source file content for files without a local path |
 
 ### Not Implemented (fallback returns `success:false`)
 
 | DAP Command | Priority | Needed? | Notes |
 |---|---|---|---|
-| `disassemble` | Medium | Nice-to-have | Would enable the Disassembly view. Requires 8051 instruction decoder. |
 | `setFunctionBreakpoints` | Low | No | We have no function-name→address resolution that can't already be done via source BPs. |
-| `setInstructionBreakpoints` | Low | No | For disassembly-view BPs. Requires `disassemble` first. |
 | `attach` | Low | No | Our model is always launch (flash+debug). |
 | `restart` | Low | No | User can just F5 again; server handles re-launch. |
 | `completions` | Low | No | REPL auto-complete. |
@@ -73,6 +73,8 @@ From `MakeCapabilities()` in `dap_types.h`:
 | `supportsWriteMemoryRequest` | `true` | |
 | `supportsSetVariable` | `true` | Edit registers/SFRs/locals/memory from Variables panel |
 | `supportsSetExpression` | `true` | Edit watch expressions |
+| `supportsDisassembleRequest` | `true` | Enables Disassembly view in VS Code |
+| `supportsInstructionBreakpoints` | `true` | Breakpoints set from the Disassembly view |
 | `supportsEvaluateForHovers` | `true` | Local vars, SFRs, registers, symbols |
 | `supportsSteppingGranularity` | `true` | `statement` (source-line loop) or `instruction` (single opcode) |
 | `supportsTerminateRequest` | `false` | Aliased internally to disconnect |
@@ -94,8 +96,6 @@ From `MakeCapabilities()` in `dap_types.h`:
 | `supportsBreakpointLocationsRequest` | No line-level granularity yet |
 | `supportsStepInTargetsRequest` | No call analysis |
 | `supportsExceptionFilterOptions` | No exception model on 8051 bare-metal |
-| `supportsDisassembleRequest` | Not implemented yet |
-| `supportsInstructionBreakpoints` | Not implemented yet |
 
 ---
 
@@ -190,7 +190,6 @@ No high-priority items remaining.
 
 ### Medium (Feature Improvements)
 
-- [ ] **Add `disassemble` handler** — Use `opcodes8051.h` + a basic 8051 disassembler.
 - [ ] **Add `DebugConfigurationProvider` to extension** — Auto-fill launch config
       when no `launch.json` exists.
 

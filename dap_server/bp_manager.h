@@ -51,6 +51,14 @@ public:
                            const uint32_t* addresses, int count,
                            uint16_t mSpace);
 
+    // Replace the complete set of instruction breakpoints.
+    // Called from the setInstructionBreakpoints DAP handler.
+    // Instruction BPs share the same kMaxUserBreakpoints hardware pool
+    // as file BPs (file BPs are armed first).
+    // Returns the count of instruction BPs actually armed.
+    int SetInstructionBreakpoints(const uint32_t* addresses, int count,
+                                  uint16_t mSpace);
+
     // Returns the total number of user breakpoints currently armed.
     int TotalUserBreakpoints() const;
 
@@ -79,7 +87,11 @@ private:
     // Per-file breakpoint storage: file path → list of code addresses.
     std::unordered_map<std::string, std::vector<uint32_t>> m_fileBreakpoints;
 
-    // Rebuild the DLL breakpoint list from all per-file entries.
+    // Instruction breakpoints (address-only, set via setInstructionBreakpoints).
+    // Shared hardware pool with file BPs; file BPs are armed first.
+    std::vector<uint32_t> m_instrBreakpoints;
+
+    // Rebuild the DLL breakpoint list from all per-file and instruction entries.
     // Returns the total number of user BPs actually armed.
     int RebuildDllBreakpoints(uint16_t mSpace);
 

@@ -28,6 +28,7 @@ compile_commands.json
 # Build artifacts
 [Dd]ebug/
 [Rr]elease/
+*.vsix
 *.obj
 *.pch
 *.pdb

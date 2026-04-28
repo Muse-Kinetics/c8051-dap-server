@@ -2,7 +2,7 @@
   "name": "silabs-8051-debug",
   "displayName": "SiLabs 8051 Debug",
   "description": "Debug adapter for Silicon Laboratories 8051 MCUs via AGDI / EC3 USB Debug Adapter",
-  "version": "0.10.0",
+  "version": "0.13.0",
   "publisher": "KMIMusic",
   "author": {
     "name": "Eric Bateman",
@@ -22,6 +22,16 @@
   "activationEvents": ["onDebugResolve:silabs8051"],
   "main": "./extension.js",
   "contributes": {
+    "configuration": {
+      "title": "SiLabs 8051 Debug",
+      "properties": {
+        "silabs8051.keilPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to your Keil installation folder (e.g. `C:\\Keil_v5`) or directly to `UV4.exe`. Leave empty to auto-detect from the registry. [Browse…](command:silabs8051.browseKeilPath)"
+        }
+      }
+    },
     "views": {
       "debug": [
         { "id": "silabs8051.registers", "name": "Registers" },
@@ -31,6 +41,13 @@
         { "id": "silabs8051.code",      "name": "CODE" }
       ]
     },
+    "commands": [
+      {
+        "command": "silabs8051.browseKeilPath",
+        "title": "Browse for Keil Installation Folder",
+        "category": "SiLabs 8051"
+      }
+    ],
     "breakpoints": [
       { "language": "c" },
       { "language": "a51" }
@@ -42,12 +59,24 @@
         "languages": [],
         "configurationAttributes": {
           "launch": {
-            "required": ["program"],
+            "required": [],
             "properties": {
               "program": {
                 "type": "string",
-                "description": "Absolute or workspace-relative path to the Intel HEX file.",
-                "default": "${workspaceFolder}/output/firmware.hex"
+                "description": "Path to the Intel HEX file. If omitted, derived automatically from 'uvprojFile' or by searching the workspace."
+              },
+              "uvprojFile": {
+                "type": "string",
+                "description": "Path to the Keil µVision project file (.uvproj or .uvprojx). Used to determine the HEX output path and (with buildBeforeDebug) to invoke UV4.exe. If omitted, the workspace is searched automatically."
+              },
+              "buildBeforeDebug": {
+                "type": "boolean",
+                "description": "Run UV4.exe -b to build the project before launching the debug session. Requires Keil µVision to be installed.",
+                "default": false
+              },
+              "buildTarget": {
+                "type": "string",
+                "description": "Keil µVision target name to build (passed as -t <name> to UV4.exe). If omitted, UV4 builds whatever target is currently active in the project's .uvopt file."
               },
               "noDebug": {
                 "type": "boolean",
@@ -67,18 +96,22 @@
             "type": "silabs8051",
             "request": "launch",
             "name": "Debug (SiLabs 8051)",
-            "program": "${workspaceFolder}/output/firmware.hex"
+            "uvprojFile": "${workspaceFolder}/YourProject.uvproj",
+            "buildBeforeDebug": true,
+            "preLaunchTask": "Ensure DAP Server"
           }
         ],
         "configurationSnippets": [
           {
             "label": "SiLabs 8051: Flash + Debug",
-            "description": "Reset the target and start a live debug session.",
+            "description": "Build with Keil, flash, and start a live debug session.",
             "body": {
               "type": "silabs8051",
               "request": "launch",
               "name": "Debug (SiLabs 8051)",
-              "program": "^\"\\${workspaceFolder}/output/firmware.hex\""
+              "uvprojFile": "^\"\\${workspaceFolder}/YourProject.uvproj\"",
+              "buildBeforeDebug": true,
+              "preLaunchTask": "Ensure DAP Server"
             }
           },
           {
@@ -88,7 +121,8 @@
               "type": "silabs8051",
               "request": "launch",
               "name": "Flash Only (SiLabs 8051)",
-              "program": "^\"\\${workspaceFolder}/output/firmware.hex\"",
+              "uvprojFile": "^\"\\${workspaceFolder}/YourProject.uvproj\"",
+              "buildBeforeDebug": true,
               "noDebug": true
             }
           },
@@ -99,7 +133,8 @@
               "type": "silabs8051",
               "request": "launch",
               "name": "Flash (no erase)",
-              "program": "^\"\\${workspaceFolder}/output/firmware.hex\"",
+              "uvprojFile": "^\"\\${workspaceFolder}/YourProject.uvproj\"",
+              "buildBeforeDebug": true,
               "noDebug": true,
               "noErase": true
             }

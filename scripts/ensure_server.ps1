@@ -23,6 +23,23 @@ if ($running) {
 Write-Host "Starting DAP server in new window (verbose log -> $log)"
 Start-Process $exe -RedirectStandardError $log
 
-# Give the server a moment to bind the TCP port before the debugger connects.
-Start-Sleep -Milliseconds 500
-Write-Host "DAP server started."
+# Poll port 4711 until the server is accepting connections (up to 10 seconds).
+$deadline = (Get-Date).AddSeconds(10)
+$ready = $false
+while ((Get-Date) -lt $deadline) {
+    try {
+        $tcp = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 4711)
+        $tcp.Close()
+        $ready = $true
+        break
+    } catch {
+        Start-Sleep -Milliseconds 100
+    }
+}
+
+if ($ready) {
+    Write-Host "DAP server ready on port 4711."
+} else {
+    Write-Error "DAP server did not start within 10 seconds."
+    exit 1
+}

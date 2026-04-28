@@ -69,6 +69,8 @@ inline nlohmann::json MakeCapabilities()
         {"supportsEvaluateForHovers",        true},
         {"supportsSetVariable",              true},
         {"supportsSetExpression",            true},
+        {"supportsDisassembleRequest",       true},
+        {"supportsInstructionBreakpoints",   true},
         {"supportsTerminateRequest",         false},
         {"supportsRestartRequest",           false},
         {"supportsGotoTargetsRequest",       false},

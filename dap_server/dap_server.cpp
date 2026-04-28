@@ -21,6 +21,7 @@
 #include "hex_loader.h"
 #include "symtab.h"
 #include "opcodes8051.h"
+#include "disasm8051.h"
 #include "log.h"
 
 #include <cstdio>
@@ -457,6 +458,8 @@ void DapServer::Dispatch(const nlohmann::json& msg)
     else if (command == "setVariable")      HandleSetVariable      (seq, args);
     else if (command == "setExpression")    HandleSetExpression    (seq, args);
     else if (command == "writeMemory")      HandleWriteMemory      (seq, args);
+    else if (command == "disassemble")             HandleDisassemble             (seq, args);
+    else if (command == "setInstructionBreakpoints") HandleSetInstructionBreakpoints(seq, args);
     else if (command == "source")            HandleSource           (seq, args);
     else {
         LOG("[DAP]  <- %s: not implemented\n", command.c_str());
@@ -1362,7 +1365,7 @@ void DapServer::HandleStackTrace(int seq, const nlohmann::json& args)
                 {"source", {{"name", BaseName(file)}, {"path", file}, {"presentationHint", "normal"}}},
                 {"line",   line},
                 {"column", 1},
-                {"instructionReference", std::string(pcBuf)},
+                {"instructionPointerReference", std::string(pcBuf)},
             };
         }
 
@@ -1371,7 +1374,7 @@ void DapServer::HandleStackTrace(int seq, const nlohmann::json& args)
             {"name",   frameName},
             {"line",   0},
             {"column", 0},
-            {"instructionReference", std::string(pcBuf)},
+            {"instructionPointerReference", std::string(pcBuf)},
         };
     };
 
@@ -2182,6 +2185,237 @@ void DapServer::HandleWriteMemory(int seq, const nlohmann::json& args)
     SendResponse(seq, "writeMemory", {
         {"bytesWritten", static_cast<int>(decoded.size())},
     });
+}
+
+// ---------------------------------------------------------------------------
+// Disassemble
+// ---------------------------------------------------------------------------
+
+void DapServer::HandleDisassemble(int seq, const nlohmann::json& args)
+{
+    // DAP disassemble request:
+    //   memoryReference: string  — hex address of the instruction (from stackFrame
+    //                              instructionPointerReference, e.g. "0x1234")
+    //   offset?:            int  — byte offset added to memoryReference
+    //   instructionOffset?: int  — instruction count offset (may be negative for
+    //                              context above current PC)
+    //   instructionCount:   int  — number of instructions to return
+
+    if (!args.contains("memoryReference") || !args.contains("instructionCount")) {
+        SendResponse(seq, "disassemble", nlohmann::json(nullptr), false, "missing parameters");
+        return;
+    }
+
+    uint16_t baseAddr = static_cast<uint16_t>(
+        std::stoul(args["memoryReference"].get<std::string>(), nullptr, 0));
+    int byteOffset  = args.value("offset", 0);
+    int instrOffset = args.value("instructionOffset", 0);
+    int instrCount  = args["instructionCount"].get<int>();
+
+    if (instrCount <= 0 || instrCount > 1024) instrCount = 64;
+
+    baseAddr = static_cast<uint16_t>(static_cast<int>(baseAddr) + byteOffset);
+
+    // For negative instructionOffset, scan backwards by at most
+    // |instrOffset|*3 bytes (3 = maximum 8051 instruction length).
+    int instrBefore = (instrOffset < 0) ? -instrOffset : 0;
+    int backBytes   = instrBefore * 3;
+
+    int startAddr = static_cast<int>(baseAddr) - backBytes;
+    if (startAddr < 0) startAddr = 0;
+
+    // Total bytes to read: backward region + enough forward bytes for all requested instructions.
+    int readCount = (static_cast<int>(baseAddr) - startAddr) + instrCount * 3 + 3;
+    if (startAddr + readCount > 0x10000)
+        readCount = 0x10000 - startAddr;
+    if (readCount <= 0) {
+        SendResponse(seq, "disassemble", {{"instructions", nlohmann::json::array()}});
+        return;
+    }
+
+    // Read CODE memory.
+    std::vector<uint8_t> mem(static_cast<size_t>(readCount), 0xFF);
+    if (g_agdi.AG_MemAcc) {
+        GADR addr{};
+        addr.Adr    = (static_cast<UL32>(amCODE) << 24) | static_cast<uint16_t>(startAddr);
+        addr.nLen   = static_cast<UL32>(readCount);
+        addr.mSpace = amCODE;
+        g_agdi.AG_MemAcc(AG_READ, mem.data(), &addr, static_cast<UL32>(readCount));
+    }
+
+    // Disassemble instructions sequentially from startAddr.
+    struct Instr {
+        uint16_t    codeAddr;
+        uint8_t     len;
+        int         byteOff;  // index into mem[]
+        std::string text;
+    };
+    std::vector<Instr> instrs;
+    instrs.reserve(static_cast<size_t>(instrBefore + instrCount + 4));
+
+    int byteOff = 0;
+    uint16_t pc = static_cast<uint16_t>(startAddr);
+
+    while (byteOff < readCount) {
+        // Pass up to 3 bytes to the disassembler; pad with 0xFF if near end.
+        uint8_t tmp[3] = {0xFF, 0xFF, 0xFF};
+        int avail = readCount - byteOff;
+        if (avail > 3) avail = 3;
+        std::memcpy(tmp, mem.data() + byteOff, static_cast<size_t>(avail));
+
+        uint8_t len = 0;
+        std::string text = Disasm8051(tmp, pc, len);
+
+        instrs.push_back({pc, len, byteOff, std::move(text)});
+        pc       = static_cast<uint16_t>(pc + len);
+        byteOff += static_cast<int>(len);
+
+        // Stop once we've collected enough instructions past baseAddr.
+        if (static_cast<int>(pc) > static_cast<int>(baseAddr) + instrCount * 3 + 3 &&
+            static_cast<int>(instrs.size()) >= instrBefore + instrCount + 1) {
+            break;
+        }
+    }
+
+    // Find the instruction starting at exactly baseAddr.
+    int baseIdx = 0;
+    for (int i = 0; i < static_cast<int>(instrs.size()); ++i) {
+        if (instrs[i].codeAddr == baseAddr) {
+            baseIdx = i;
+            break;
+        }
+    }
+
+    // Apply instructionOffset (negative = go up, positive = go down).
+    int startIdx = baseIdx + instrOffset;
+    if (startIdx < 0) startIdx = 0;
+
+    // Build the DAP response array.
+    nlohmann::json instructions = nlohmann::json::array();
+
+    for (int i = startIdx;
+         i < static_cast<int>(instrs.size()) && static_cast<int>(instructions.size()) < instrCount;
+         ++i)
+    {
+        const auto& ins = instrs[i];
+        char addrBuf[12];
+        snprintf(addrBuf, sizeof(addrBuf), "0x%04X", ins.codeAddr);
+
+        // Hex byte string for instructionBytes ("12 34 56").
+        char bytesBuf[12] = "";
+        for (int b = 0; b < static_cast<int>(ins.len) &&
+             ins.byteOff + b < readCount; ++b)
+        {
+            char tmp[5];
+            snprintf(tmp, sizeof(tmp), b == 0 ? "%02X" : " %02X",
+                     mem[static_cast<size_t>(ins.byteOff + b)]);
+            strncat(bytesBuf, tmp, sizeof(bytesBuf) - std::strlen(bytesBuf) - 1);
+        }
+
+        nlohmann::json entry = {
+            {"address",          std::string(addrBuf)},
+            {"instruction",      ins.text},
+            {"instructionBytes", std::string(bytesBuf)},
+        };
+
+        // Attach source location when available.
+        auto loc = g_symtab.LookupLine(ins.codeAddr);
+        if (loc) {
+            entry["location"] = {{"name", loc->file}, {"path", loc->file}};
+            entry["line"]     = loc->line;
+        }
+
+        instructions.push_back(std::move(entry));
+    }
+
+    // Pad with placeholder entries if we ran out of address space.
+    while (static_cast<int>(instructions.size()) < instrCount) {
+        uint16_t nextAddr = 0;
+        if (!instructions.empty()) {
+            nextAddr = static_cast<uint16_t>(
+                std::stoul(instructions.back()["address"].get<std::string>(), nullptr, 16) + 1u);
+        }
+        char addrBuf[12];
+        snprintf(addrBuf, sizeof(addrBuf), "0x%04X", nextAddr);
+        instructions.push_back({
+            {"address",          std::string(addrBuf)},
+            {"instruction",      "??"},
+            {"instructionBytes", ""},
+        });
+        if (nextAddr == 0xFFFF) break;
+    }
+
+    LOG("[DAP]  disassemble base=0x%04X instrOffset=%d count=%d -> %zu instrs\n",
+        baseAddr, instrOffset, instrCount, instructions.size());
+
+    SendResponse(seq, "disassemble", {{"instructions", instructions}});
+}
+
+// ---------------------------------------------------------------------------
+// SetInstructionBreakpoints
+// ---------------------------------------------------------------------------
+
+void DapServer::HandleSetInstructionBreakpoints(int seq, const nlohmann::json& args)
+{
+    // DAP setInstructionBreakpoints request:
+    //   breakpoints: [ { instructionReference: string, offset?: number }, ... ]
+    // instructionReference is a hex address string (same format as
+    // stackFrame.instructionPointerReference, e.g. "0x1234").
+    // Instruction BPs share the kMaxUserBreakpoints hardware pool with file BPs;
+    // file BPs are armed first, so instruction BPs may be unverified if the
+    // pool is already full.
+
+    nlohmann::json bpResults = nlohmann::json::array();
+
+    if (!args.contains("breakpoints") || !args["breakpoints"].is_array()) {
+        // Empty / missing array — clear all instruction BPs.
+        if (g_runControl.IsSessionActive())
+            g_bpManager.SetInstructionBreakpoints(nullptr, 0, amCODE);
+        SendResponse(seq, "setInstructionBreakpoints", {{"breakpoints", bpResults}});
+        return;
+    }
+
+    const auto& bpList = args["breakpoints"];
+    std::vector<uint32_t> addresses;
+    addresses.reserve(bpList.size());
+
+    for (const auto& bp : bpList) {
+        std::string ref = bp.value("instructionReference", "0");
+        int bpOffset    = bp.value("offset", 0);
+        uint16_t addr   = static_cast<uint16_t>(
+            std::stoul(ref, nullptr, 0) + static_cast<unsigned>(bpOffset));
+        addresses.push_back(static_cast<uint32_t>(addr));
+    }
+
+    int count = static_cast<int>(addresses.size());
+    int armed = 0;
+
+    if (g_runControl.IsSessionActive()) {
+        armed = g_bpManager.SetInstructionBreakpoints(
+            addresses.empty() ? nullptr : addresses.data(), count, amCODE);
+    }
+
+    // Verify which BPs are actually in the DLL linked list.
+    auto isArmed = [&](uint32_t addr) -> bool {
+        for (AG_BP* p = g_bpManager.HeadPtr() ? *g_bpManager.HeadPtr() : nullptr;
+             p; p = p->next) {
+            if (p->Adr == addr) return true;
+        }
+        return false;
+    };
+
+    for (int i = 0; i < count; ++i) {
+        bool ok = g_runControl.IsSessionActive() && isArmed(addresses[i]);
+        nlohmann::json entry = {{"verified", ok}, {"id", i + 1}};
+        if (!ok && g_runControl.IsSessionActive()) {
+            entry["message"] = "Hardware limit: max " +
+                               std::to_string(kMaxUserBreakpoints) + " breakpoints total";
+        }
+        bpResults.push_back(std::move(entry));
+    }
+
+    LOG("[DAP]  setInstructionBreakpoints: %d requested, %d armed\n", count, armed);
+    SendResponse(seq, "setInstructionBreakpoints", {{"breakpoints", bpResults}});
 }
 
 void DapServer::HandleSource(int seq, const nlohmann::json& args)
