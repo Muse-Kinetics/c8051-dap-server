@@ -302,6 +302,7 @@ Set-Content "$stage\extension.vsixmanifest" @"
     <GalleryFlags>Public</GalleryFlags>
     <Properties>
       <Property Id="Microsoft.VisualStudio.Code.Engine" Value="^1.80.0"/>
+      <Property Id="Microsoft.VisualStudio.Code.TargetPlatform" Value="undefined"/>
     </Properties>
   </Metadata>
   <Installation>

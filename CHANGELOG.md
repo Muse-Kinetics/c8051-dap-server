@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.13.1] — 2026-04-28
+
+### Fixed
+- VSIX install via `code --install-extension` silently failed on VS Code 1.113.0+: added `Microsoft.VisualStudio.Code.TargetPlatform` property to `extension.vsixmanifest` so the install CLI writes `targetPlatform` to `extensions.json` and VS Code loads the extension on startup
+
+---
+
 ## [0.13.0] — 2026-04-21
 
 Initial public release.
