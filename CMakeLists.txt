@@ -9,7 +9,7 @@
 
 cmake_minimum_required(VERSION 3.20)
 
-project(C8051_dap_server VERSION 0.11.0 LANGUAGES CXX)
+project(C8051_dap_server VERSION 0.14.6 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "This project targets Windows only (SiC8051F.dll is a 32-bit Windows DLL).")
@@ -131,26 +131,26 @@ if(EXISTS "${SOFTSTEP_DEBUG_BIN}")
   message(STATUS "Deploy target: ${SOFTSTEP_DEBUG_BIN}")
   add_custom_command(TARGET dap_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:dap_server>"
-            "${SOFTSTEP_DEBUG_BIN}/dap_server.exe"
+      "$<TARGET_FILE:dap_server>"
+      "${SOFTSTEP_DEBUG_BIN}/dap_server.exe"
     COMMENT "Deploy dap_server.exe -> _debugging/bin/"
     VERBATIM)
   add_custom_command(TARGET dap_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${SILABS_SIC8051F_DLL}"
-            "${SOFTSTEP_DEBUG_BIN}/SiC8051F.dll"
+      "${SILABS_SIC8051F_DLL}"
+      "${SOFTSTEP_DEBUG_BIN}/SiC8051F.dll"
     COMMENT "Deploy SiC8051F.dll -> _debugging/bin/"
     VERBATIM)
   add_custom_command(TARGET dap_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${SILABS_USBHID_DLL}"
-            "${SOFTSTEP_DEBUG_BIN}/USBHID.dll"
+      "${SILABS_USBHID_DLL}"
+      "${SOFTSTEP_DEBUG_BIN}/USBHID.dll"
     COMMENT "Deploy USBHID.dll -> _debugging/bin/"
     VERBATIM)
   add_custom_command(TARGET dap_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/dap_server/SiC8051F.wsp"
-            "${SOFTSTEP_DEBUG_BIN}/SiC8051F.wsp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/dap_server/SiC8051F.wsp"
+      "${SOFTSTEP_DEBUG_BIN}/SiC8051F.wsp"
     COMMENT "Deploy SiC8051F.wsp -> _debugging/bin/"
     VERBATIM)
 else()

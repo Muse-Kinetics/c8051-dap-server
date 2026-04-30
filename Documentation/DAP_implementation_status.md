@@ -152,7 +152,10 @@ From `MakeCapabilities()` in `dap_types.h`:
 
 ## 5. Open Bugs
 
-No open bugs.
+| Bug | Description | Current State / Workaround |
+|-----|-------------|----------------------------|
+| BUG-13 | Post-stop AGDI teardown often ends with `SiC8051F: OK Communication failure.` even though the server remains alive and returns to `Waiting for next DAP client` | **Open** — treat the post-stop server process as dirty and restart it before the next launch; `restart_server_safe.ps1` is the current workaround |
+| BUG-14 | `continue` can time out waiting for a breakpoint halt and then emit a synthetic stopped event at the previous PC | **Open** — reproduced in SoftStep from `app.c:138`; the stale stop should not be trusted, and the session/server should be restarted after the failure |
 
 ---
 

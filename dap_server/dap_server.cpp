@@ -606,6 +606,60 @@ void DapServer::HandleLaunch(int seq, const nlohmann::json& args)
 
         g_runControl.ReadRegisters();
         uint32_t pc = g_registers.PC();
+        LOG("[DEBUG] Target halted at PC=0x%04X after reset\n", pc);
+
+        // Determine the application entry point.
+        // Priority: explicit 'startAddress' launch arg > HEX base address.
+        // When the app is linked above 0x0000 (e.g. 0x2400 for app firmware
+        // that coexists with a bootloader), the target resets into bootloader
+        // code that has no debug symbols.  Run-to the entry point so the
+        // first halt is inside the application code.
+        uint32_t entryPoint = g_hexLoader.BaseAddress();
+        if (args.contains("startAddress")) {
+            try {
+                const std::string& addrStr = args["startAddress"].get<std::string>();
+                entryPoint = static_cast<uint32_t>(std::stoul(addrStr, nullptr, 0));
+                LOG("[DEBUG] startAddress override: 0x%04X\n", entryPoint);
+            } catch (...) {}
+        }
+
+        if (entryPoint > pc) {
+            LOG("[DEBUG] Running to app entry 0x%04X (reset vector was 0x%04X)\n", entryPoint, pc);
+
+            // Disable the C8051F34x/F38x watchdog before letting the CPU run.
+            // Without this the WDT (~95 ms post-reset) fires before the
+            // bootloader can reach 0x2400, the chip resets, AG_GOTILADR
+            // returns immediately and PC reads back 0x0000.
+            //
+            // The 0xDE/0xAD WDTCN sequence requires both writes to land
+            // within 4 system clocks of each other — going through AGDI
+            // USB transactions that's impossible.  Instead we clear
+            // PCA0MD.WDTE (bit 6) which permanently disables the WDT
+            // with no timing constraint.  Read-modify-write to preserve
+            // the other PCA mode bits (CIDL, WDLCK, CPS[2:0], ECF).
+            if (g_agdi.AG_MemAcc) {
+                constexpr uint16_t PCA0MD_SFR = 0xD9;
+                constexpr uint8_t  WDTE_BIT   = 0x40;
+                GADR pcaAddr{};
+                pcaAddr.Adr    = (static_cast<UL32>(amDATA) << 24) | PCA0MD_SFR;
+                pcaAddr.nLen   = 1;
+                pcaAddr.mSpace = amDATA;
+                UC8 pcaVal = 0;
+                g_agdi.AG_MemAcc(AG_READ, &pcaVal, &pcaAddr, 1);
+                UC8 newPca = static_cast<UC8>(pcaVal & ~WDTE_BIT);
+                g_agdi.AG_MemAcc(AG_WRITE, &newPca, &pcaAddr, 1);
+                LOG("[DEBUG] WDT disabled: PCA0MD 0x%02X -> 0x%02X (cleared WDTE)\n",
+                    pcaVal, newPca);
+            }
+
+            g_runControl.ResetHaltEvent();
+            g_runControl.RequestRunToAddr(entryPoint);
+            if (!g_runControl.WaitForHalt(5000)) {
+                LOG("[WARN] Timeout waiting for run-to entry 0x%04X\n", entryPoint);
+            }
+            g_runControl.ReadRegisters();
+            pc = g_registers.PC();
+        }
         LOG("[DEBUG] Target halted at PC=0x%04X\n", pc);
 
         // Defer the stopped event until configurationDone (DAP protocol
@@ -774,30 +828,31 @@ void DapServer::HandleContinue(int seq, const nlohmann::json& /*args*/)
     nlohmann::json body = {{"allThreadsContinued", true}};
     SendResponse(seq, "continue", body);
 
-    // Attempt to disable the C8051F380 watchdog timer before releasing the CPU.
-    // The WDT has a default timeout of ~95ms after a debug reset, which is shorter
-    // than the firmware's hardware initialization sequence.  If the WDT fires before
-    // the firmware pets it, the CPU resets and AG_RUNSTOP never fires, causing a
-    // 30-second timeout on this side.
+    // Disable the C8051F34x/F38x watchdog before releasing the CPU.
+    // The WDT has a default timeout of ~95 ms after a debug reset, which is
+    // shorter than the firmware's hardware-initialization sequence; if it
+    // fires before the firmware can pet it the CPU resets and AG_RUNSTOP
+    // never fires, causing a 30-second timeout on this side.
     //
-    // WDTCN SFR on C8051F380 is at address 0x97 (DATA/SFR space).
-    // Disable sequence: write 0xDE then 0xAD to WDTCN.
-    // Note: the debug interface writes are not guaranteed to be back-to-back
-    // within one clock cycle, so the WDT may not accept the disable.  This is
-    // a best-effort attempt; the firmware's own WDT init will take over if it
-    // succeeds in running past initialization.
+    // The 0xDE/0xAD WDTCN sequence requires both writes within 4 system
+    // clocks — impossible across two AGDI USB transactions.  Clearing
+    // PCA0MD.WDTE (bit 6) disables the WDT in a single SFR write with no
+    // timing constraint.  Read-modify-write to preserve other PCA bits.
     if (g_agdi.AG_MemAcc) {
-        constexpr uint16_t WDTCN_SFR = 0x97;   // C8051F380 watchdog control SFR
-        GADR wdtAddr{};
-        wdtAddr.Adr    = (static_cast<UL32>(amDATA) << 24) | WDTCN_SFR;
-        wdtAddr.nLen   = 1;
-        wdtAddr.mSpace = amDATA;
-
-        UC8 wdtDisable1 = 0xDE;
-        UC8 wdtDisable2 = 0xAD;
-        g_agdi.AG_MemAcc(AG_WRITE, &wdtDisable1, &wdtAddr, 1);
-        g_agdi.AG_MemAcc(AG_WRITE, &wdtDisable2, &wdtAddr, 1);
-        LOG("[DEBUG] WDT disable sequence written to WDTCN (0x%02X)\n", WDTCN_SFR);
+        constexpr uint16_t PCA0MD_SFR = 0xD9;
+        constexpr uint8_t  WDTE_BIT   = 0x40;
+        GADR pcaAddr{};
+        pcaAddr.Adr    = (static_cast<UL32>(amDATA) << 24) | PCA0MD_SFR;
+        pcaAddr.nLen   = 1;
+        pcaAddr.mSpace = amDATA;
+        UC8 pcaVal = 0;
+        g_agdi.AG_MemAcc(AG_READ, &pcaVal, &pcaAddr, 1);
+        if (pcaVal & WDTE_BIT) {
+            UC8 newPca = static_cast<UC8>(pcaVal & ~WDTE_BIT);
+            g_agdi.AG_MemAcc(AG_WRITE, &newPca, &pcaAddr, 1);
+            LOG("[DEBUG] WDT disabled before continue: PCA0MD 0x%02X -> 0x%02X\n",
+                pcaVal, newPca);
+        }
     }
 
     // Post AG_GOFORBRK to the main thread so the reader thread stays free
@@ -1706,6 +1761,24 @@ void DapServer::HandleEvaluate(int seq, const nlohmann::json& args)
         }
     }
 
+    // Try `bit` variable lookup (C51 bit-addressable PUBLIC symbols).
+    if (g_symtab.IsLoaded() && g_agdi.AG_MemAcc) {
+        auto bv = g_symtab.LookupBitByName(expr);
+        if (bv) {
+            UC8 rdBuf[1] = {};
+            GADR a{};
+            a.mSpace = amDATA;
+            a.Adr    = (static_cast<UL32>(amDATA) << 24) | bv->byteAddr;
+            g_agdi.AG_MemAcc(AG_READ, rdBuf, &a, 1);
+            uint8_t bitVal = (rdBuf[0] >> bv->bitIndex) & 0x1;
+            SendResponse(seq, "evaluate", {
+                {"result", std::string(bitVal ? "true" : "false")},
+                {"variablesReference", 0},
+            });
+            return;
+        }
+    }
+
     // Try global variable lookup (PUBLIC data symbols from m51).
     if (g_symtab.IsLoaded() && g_agdi.AG_MemAcc) {
         auto gv = g_symtab.LookupGlobalByName(expr);
@@ -2097,6 +2170,50 @@ void DapServer::HandleSetExpression(int seq, const nlohmann::json& args)
             WriteMemoryValue(lv->mSpace, lv->addr, padded, sz);
             std::string rb = ReadBackHex(lv->mSpace, lv->addr, sz);
             SendResponse(seq, "setExpression", {{"value", rb}});
+            return;
+        }
+    }
+
+    // Bit variable (C51 `bit` PUBLIC symbols). Accepts 0/1/false/true (any case).
+    if (g_symtab.IsLoaded() && g_agdi.AG_MemAcc) {
+        auto bv = g_symtab.LookupBitByName(expr);
+        if (bv) {
+            int bitVal = -1;
+            std::string vlow;
+            for (char c : value) vlow += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if      (vlow == "0" || vlow == "false") bitVal = 0;
+            else if (vlow == "1" || vlow == "true")  bitVal = 1;
+            else {
+                // Allow hex/decimal numeric forms too (non-zero -> 1).
+                UC8 tmp[4] = {};
+                int n = ParseHexValue(value, tmp, 1);
+                if (n > 0) bitVal = (tmp[0] != 0) ? 1 : 0;
+            }
+            if (bitVal < 0) {
+                SendResponse(seq, "setExpression", nlohmann::json(nullptr), false,
+                             "invalid bit value (use 0/1/true/false)");
+                return;
+            }
+
+            // Read-modify-write the containing byte in DATA space.
+            GADR a{};
+            a.mSpace = amDATA;
+            a.Adr    = (static_cast<UL32>(amDATA) << 24) | bv->byteAddr;
+            UC8 rdBuf[4] = {};
+            g_agdi.AG_MemAcc(AG_READ, rdBuf, &a, 1);
+            UC8 mask = static_cast<UC8>(1u << bv->bitIndex);
+            UC8 newByte = bitVal ? (rdBuf[0] | mask)
+                                 : (rdBuf[0] & static_cast<UC8>(~mask));
+            UC8 wrByte = newByte;
+            g_agdi.AG_MemAcc(AG_WRITE, &wrByte, &a, 1);
+
+            // Read back to confirm.
+            std::memset(rdBuf, 0, sizeof(rdBuf));
+            g_agdi.AG_MemAcc(AG_READ, rdBuf, &a, 1);
+            uint8_t finalBit = (rdBuf[0] >> bv->bitIndex) & 0x1;
+            SendResponse(seq, "setExpression", {
+                {"value", std::string(finalBit ? "true" : "false")},
+            });
             return;
         }
     }

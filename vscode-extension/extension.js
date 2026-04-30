@@ -16,6 +16,40 @@ const fs     = require('fs');
 const cp     = require('child_process');
 const os     = require('os');
 
+const INTELLISENSE_SHIM = `#pragma once
+
+#ifdef __INTELLISENSE__
+#include <stdbool.h>
+#include <stdint.h>
+
+/*
+ * Keil C51 memory-space and register keywords are not understood by the
+ * VS Code C/C++ parser. Define editor-only stand-ins so IntelliSense can
+ * parse the firmware sources without affecting the real toolchain.
+ */
+#define bit bool
+
+#define data
+#define idata
+#define bdata
+#define pdata
+#define xdata
+#define code
+
+#define sfr volatile unsigned char
+#define sfr16 volatile unsigned short
+#define sbit volatile bool
+
+#define interrupt(...)
+#define using(...)
+#define reentrant
+#define small
+#define compact
+#define large
+#define _at_
+#endif
+`;
+
 // ---------------------------------------------------------------------------
 // TreeDataProvider that fetches DAP variables for a given variablesReference.
 // ---------------------------------------------------------------------------
@@ -232,52 +266,158 @@ async function buildWithUv4(uv4Path, uvprojPath, outputChannel, flash = false, t
 // Server helpers
 // ---------------------------------------------------------------------------
 
-// Test whether TCP port is accepting connections.
-function isPortOpen(port) {
-    const net = require('net');
-    return new Promise(resolve => {
-        const sock = new net.Socket();
-        sock.setTimeout(200);
-        sock.on('connect', () => { sock.destroy(); resolve(true); });
-        sock.on('error',   () => { sock.destroy(); resolve(false); });
-        sock.on('timeout', () => { sock.destroy(); resolve(false); });
-        sock.connect(port, '127.0.0.1');
-    });
+// Append a line to a trace file so we can diagnose without devtools.
+function trace(msg) {
+    try {
+        fs.appendFileSync(path.join(os.tmpdir(), 'silabs8051_ext.log'),
+            `[${new Date().toISOString()}] ${msg}\n`);
+    } catch {}
 }
 
-// Poll port until open or timeout. Resolves true if port opens in time.
-async function waitForPort(port, timeoutMs) {
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function psQuote(value) {
+    return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function runPowerShellSync(command) {
+    return cp.spawnSync('powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', command],
+        { windowsHide: true, encoding: 'utf8' });
+}
+
+function isServerProcessRunning() {
+    const res = runPowerShellSync(
+        "@(Get-Process -Name 'dap_server' -ErrorAction SilentlyContinue).Count");
+    if (res.status !== 0) return false;
+    const count = parseInt((res.stdout || '').toString().trim(), 10);
+    return Number.isFinite(count) && count > 0;
+}
+
+async function waitForLogPattern(logFile, pattern, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-        if (await isPortOpen(port)) return true;
-        await new Promise(r => setTimeout(r, 100));
+        try {
+            if (fs.existsSync(logFile)) {
+                const text = fs.readFileSync(logFile, 'utf8');
+                if (pattern.test(text)) return true;
+            }
+        } catch {}
+        await sleep(100);
     }
     return false;
 }
 
+async function startBundledServer(exePath, logFile) {
+    const stdoutLog = path.join(path.dirname(logFile), 'dap_server_stdout.log');
+    const command =
+        `Start-Process -WindowStyle Hidden ` +
+        `-WorkingDirectory ${psQuote(path.dirname(exePath))} ` +
+        `-FilePath ${psQuote(exePath)} ` +
+        `-RedirectStandardOutput ${psQuote(stdoutLog)} ` +
+        `-RedirectStandardError ${psQuote(logFile)}`;
+    const res = runPowerShellSync(command);
+    if (res.status !== 0) {
+        const stderr = (res.stderr || '').toString().trim();
+        const stdout = (res.stdout || '').toString().trim();
+        throw new Error(stderr || stdout || `Start-Process failed with code ${res.status}`);
+    }
+}
+
+function stopServerProcess() {
+    const res = runPowerShellSync(
+        "Get-Process -Name 'dap_server' -ErrorAction SilentlyContinue | " +
+        "Stop-Process -Force -ErrorAction SilentlyContinue");
+    return res.status === 0;
+}
+
+async function restartServerProcess(extensionPath) {
+    stopServerProcess();
+    await sleep(250);
+    return ensureServer(extensionPath);
+}
+
 // Ensure dap_server.exe is running. Uses bundled exe from bin\ if present;
 // falls back to ensure_server.ps1 in the scripts folder (development mode).
+// Returns true if the server is reachable on port 4711 by the time it returns,
+// false otherwise (caller should abort the launch).
 async function ensureServer(extensionPath) {
+    try {
+        fs.appendFileSync(path.join(os.tmpdir(), 'silabs8051_ext_trace.log'),
+            `[${new Date().toISOString()}] ensureServer enter (extPath=${extensionPath})\n`);
+    } catch {}
+    if (isServerProcessRunning()) {
+        try {
+            fs.appendFileSync(path.join(os.tmpdir(), 'silabs8051_ext_trace.log'),
+                `[${new Date().toISOString()}] ensureServer: dap_server process already running, returning true\n`);
+        } catch {}
+        return true;
+    }
+
     const exePath = path.join(extensionPath, 'bin', 'dap_server.exe');
+    let logFile = path.join(os.tmpdir(), 'dap_server.log');
+
     if (!fs.existsSync(exePath)) {
         // Dev mode: use ensure_server.ps1 from the sibling scripts folder.
         const scriptPath = path.join(extensionPath, '..', 'scripts', 'ensure_server.ps1');
-        if (fs.existsSync(scriptPath)) {
-            cp.spawn('powershell.exe',
-                ['-NoProfile', '-NonInteractive', '-File', scriptPath],
-                { windowsHide: true, detached: false });
+        if (!fs.existsSync(scriptPath)) {
+            vscode.window.showErrorMessage(
+                `SiLabs 8051: dap_server.exe not found in ${path.dirname(exePath)} ` +
+                `and no ensure_server.ps1 fallback available.`);
+            return false;
         }
-        return;
+        // Run synchronously so we know whether it succeeded.
+        const res = cp.spawnSync('powershell.exe',
+            ['-NoProfile', '-NonInteractive', '-File', scriptPath],
+            { windowsHide: true });
+        if (res.status !== 0) {
+            vscode.window.showErrorMessage(
+                `SiLabs 8051: ensure_server.ps1 exited with code ${res.status}. ` +
+                `stderr: ${(res.stderr || '').toString().slice(0, 500)}`);
+            return false;
+        }
+    } else {
+        try {
+            // Match the proven-good manual path used by ensure_server.ps1.
+            // A raw detached Node spawn plus "port open" proved too weak on
+            // cold start: F5 could attach before the server/adapter path had
+            // fully settled, leaving the session at PC=0x0000.
+            await startBundledServer(exePath, logFile);
+        } catch (err) {
+            vscode.window.showErrorMessage(
+                `SiLabs 8051: failed to spawn dap_server.exe: ${err.message}`);
+            return false;
+        }
     }
-    if (await isPortOpen(4711)) return;  // already running
-    const logFile = path.join(os.tmpdir(), 'dap_server.log');
-    const logFd = fs.openSync(logFile, 'a');
-    cp.spawn(exePath, [], {
-        windowsHide: true,
-        detached: true,
-        stdio: ['ignore', logFd, logFd]
-    }).unref();
-    await waitForPort(4711, 10000);
+
+    // First-launch DLL load can be slow on cold caches — wait up to 30 s.
+    // Do not probe the TCP port directly here: dap_server treats a connect /
+    // disconnect as a real DAP client and posts a stop-request. That readiness
+    // probe can perturb a cold start before VS Code's actual DAP client attaches.
+    const up = await waitForLogPattern(
+        logFile,
+        /\[TCP\]\s+Listening on 127\.0\.0\.1:4711/,
+        30000);
+    try {
+        fs.appendFileSync(path.join(os.tmpdir(), 'silabs8051_ext_trace.log'),
+            `[${new Date().toISOString()}] ensureServer: waitForReadyLog returned ${up}\n`);
+    } catch {}
+    if (!up) {
+        // If a hidden startup wedges, do not leave an orphaned background
+        // server process running with no visible console window to close.
+        stopServerProcess();
+        vscode.window.showErrorMessage(
+            `SiLabs 8051: DAP server did not reach the listening state within 30s. ` +
+            `The server process was stopped automatically. Check log: ${logFile}`);
+        return false;
+    }
+
+    // Give the server a short settle interval after entering the listening
+    // state before the first real DAP client connects.
+    await sleep(1000);
+    return true;
 }
 
 // Copy SiC8051F.dll and USBHID.dll from the user's Keil installation into
@@ -305,10 +445,24 @@ async function ensureDlls(extensionPath) {
 
     // uv4Path = <keilRoot>\UV4\UV4.exe  →  keilRoot = two levels up
     const keilRoot = path.dirname(path.dirname(uv4Path));
-    const src1 = path.join(keilRoot, 'C51', 'Bin', 'SiC8051F.dll');
+
+    // Some local Keil setups replace C51\Bin\SiC8051F.dll with a proxy and
+    // preserve the original vendor DLL as SiC8051F_real.dll. The DAP server's
+    // known-good runtime payload matches the original DLL, so prefer that when
+    // present. Fall back to the normal filename for stock installs.
+    const src1Candidates = [
+        path.join(keilRoot, 'C51', 'Bin', 'SiC8051F_real.dll'),
+        path.join(keilRoot, 'UV4', 'Debug_Adapter_DLLs', 'SiC8051F.dll'),
+        path.join(keilRoot, 'C51', 'Bin', 'SiC8051F.dll'),
+    ];
+    const src1 = src1Candidates.find(fs.existsSync);
     const src2 = path.join(keilRoot, 'UV4', 'USBHID.dll');
     try {
         if (!fs.existsSync(binDir)) fs.mkdirSync(binDir, { recursive: true });
+        if (!src1) {
+            throw new Error(
+                `SiC8051F.dll not found in any expected Keil location under ${keilRoot}`);
+        }
         if (!fs.existsSync(dll1)) fs.copyFileSync(src1, dll1);
         if (!fs.existsSync(dll2)) fs.copyFileSync(src2, dll2);
         return true;
@@ -317,6 +471,73 @@ async function ensureDlls(extensionPath) {
             `SiLabs 8051: Failed to copy adapter DLLs from Keil: ${err.message}`);
         return false;
     }
+}
+
+function mergeUniqueStrings(existing, required) {
+    const out = Array.isArray(existing) ? existing.slice() : [];
+    for (const value of required) {
+        if (!out.includes(value)) out.push(value);
+    }
+    return out;
+}
+
+async function pickWorkspaceFolder() {
+    const folders = vscode.workspace.workspaceFolders || [];
+    if (folders.length === 0) {
+        vscode.window.showErrorMessage(
+            'SiLabs 8051: Open a firmware workspace folder before configuring IntelliSense.');
+        return null;
+    }
+    if (folders.length === 1) return folders[0];
+
+    const picked = await vscode.window.showWorkspaceFolderPick({
+        placeHolder: 'Select the firmware workspace folder to configure for Keil C51 IntelliSense'
+    });
+    return picked || null;
+}
+
+async function configureIntelliSenseForFolder(folder) {
+    const vscodeDir = path.join(folder.uri.fsPath, '.vscode');
+    const shimPath = path.join(vscodeDir, 'intellisense_8051.h');
+    const propsPath = path.join(vscodeDir, 'c_cpp_properties.json');
+    const shimRel = '${workspaceFolder}/.vscode/intellisense_8051.h';
+
+    fs.mkdirSync(vscodeDir, { recursive: true });
+    fs.writeFileSync(shimPath, INTELLISENSE_SHIM, 'utf8');
+
+    let props = { version: 4, configurations: [] };
+    if (fs.existsSync(propsPath)) {
+        try {
+            props = JSON.parse(fs.readFileSync(propsPath, 'utf8'));
+        } catch (err) {
+            throw new Error(`Failed to parse ${propsPath}: ${err.message}`);
+        }
+    }
+
+    if (!Array.isArray(props.configurations)) props.configurations = [];
+
+    const configName = 'SiLabs 8051';
+    let cfg = props.configurations.find(c => c && c.name === configName);
+    if (!cfg) {
+        cfg = { name: configName };
+        props.configurations.push(cfg);
+    }
+
+    cfg.includePath = mergeUniqueStrings(cfg.includePath, [
+        '${workspaceFolder}',
+        '${workspaceFolder}/**'
+    ]);
+    cfg.defines = mergeUniqueStrings(cfg.defines, [
+        '__C51__',
+        '__INTELLISENSE__'
+    ]);
+    cfg.forcedInclude = mergeUniqueStrings(cfg.forcedInclude, [shimRel]);
+    if (!cfg.cStandard) cfg.cStandard = 'c11';
+    if (!cfg.cppStandard) cfg.cppStandard = 'c++17';
+    if (!cfg.intelliSenseMode) cfg.intelliSenseMode = 'windows-msvc-x86';
+
+    fs.writeFileSync(propsPath, `${JSON.stringify(props, null, 2)}\n`, 'utf8');
+    return { shimPath, propsPath };
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +567,55 @@ exports.activate = function (context) {
         })
     );
 
+    context.subscriptions.push(
+        vscode.commands.registerCommand('silabs8051.startServer', async () => {
+            const ok = await ensureServer(context.extensionPath);
+            if (ok) {
+                vscode.window.showInformationMessage(
+                    'SiLabs 8051: DAP server is running on port 4711.');
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('silabs8051.stopServer', async () => {
+            stopServerProcess();
+            vscode.window.showInformationMessage('SiLabs 8051: DAP server stopped.');
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('silabs8051.restartServer', async () => {
+            const ok = await restartServerProcess(context.extensionPath);
+            if (ok) {
+                vscode.window.showInformationMessage(
+                    'SiLabs 8051: DAP server restarted and is running on port 4711.');
+            }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('silabs8051.configureIntelliSense', async () => {
+            const folder = await pickWorkspaceFolder();
+            if (!folder) return;
+            try {
+                const result = await configureIntelliSenseForFolder(folder);
+                vscode.window.showInformationMessage(
+                    `SiLabs 8051: IntelliSense configured for ${folder.name}`,
+                    'Open c_cpp_properties.json'
+                ).then(choice => {
+                    if (choice === 'Open c_cpp_properties.json') {
+                        vscode.workspace.openTextDocument(result.propsPath)
+                            .then(doc => vscode.window.showTextDocument(doc));
+                    }
+                });
+            } catch (err) {
+                vscode.window.showErrorMessage(
+                    `SiLabs 8051: Failed to configure IntelliSense: ${err.message}`);
+            }
+        })
+    );
+
     // Persistent output channel for build output.
     const buildChannel = vscode.window.createOutputChannel('SiLabs 8051 Build');
     context.subscriptions.push(buildChannel);
@@ -365,16 +635,16 @@ exports.activate = function (context) {
     // -----------------------------------------------------------------------
     const configProvider = {
         async resolveDebugConfiguration(_folder, config, _token) {
+            try {
+                fs.appendFileSync(path.join(os.tmpdir(), 'silabs8051_ext_trace.log'),
+                    `[${new Date().toISOString()}] resolveDebugConfiguration enter, name=${config && config.name}\n`);
+            } catch {}
             // Empty config means no launch.json or no selection — synthesise defaults.
             if (!config.type && !config.request && !config.name) {
                 config.type    = 'silabs8051';
                 config.request = 'launch';
                 config.name    = 'Debug (SiLabs 8051)';
             }
-
-            // ---- Start DAP server early so it's ready by the time we connect ----
-            // Fire-and-forget — runs concurrently with the build.
-            ensureServer(context.extensionPath);
 
             const ws = vscode.workspace.workspaceFolders;
             // _folder is the workspace folder that owns the launch.json — use it as
@@ -492,6 +762,13 @@ exports.activate = function (context) {
                 }
             }
 
+            // ---- Ensure DAP server is running before returning config ----
+            trace('about to call ensureServer');
+            const ok = await ensureServer(context.extensionPath);
+            trace(`ensureServer returned ${ok}`);
+            if (!ok) return undefined;  // abort launch — error already shown
+
+            trace('resolveDebugConfiguration returning config');
             return config;
         }
     };
@@ -502,6 +779,7 @@ exports.activate = function (context) {
     // DAP server connection factory.
     const factory = {
         createDebugAdapterDescriptor(_session, _executable) {
+            trace('createDebugAdapterDescriptor called');
             return new vscode.DebugAdapterServer(4711);
         }
     };

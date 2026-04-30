@@ -50,6 +50,7 @@ dap_ref/
 # Runtime log output
 *.log
 stderr_log.txt
+dap_server.pid
 
 # Local multi-root workspace file (contains machine-specific paths)
 *.code-workspace

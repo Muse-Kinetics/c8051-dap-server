@@ -291,6 +291,7 @@ void SymbolTable::Clear()
     m_lines.clear();
     m_locals.clear();
     m_globals.clear();
+    m_bits.clear();
     m_loaded = false;
 }
 
@@ -531,6 +532,52 @@ void SymbolTable::ParseM51(const std::string& m51Path, const std::string& buildR
             skip_global:;
         }
 
+        // ---- Parse B:XXh.B PUBLIC lines (C51 `bit` variables) ----
+        // Format: "B:0021H.4       PUBLIC        libraryChecksComplete"
+        // The byte address is in bit-addressable DATA (0x20-0x2F); the .B
+        // suffix is the bit index 0..7 within that byte.
+        if (line.size() >= 4 && line[1] == ':' && std::toupper(line[0]) == 'B') {
+            size_t hPos = line.find_first_of("Hh", 2);
+            if (hPos != std::string::npos && line.find("PUBLIC") != std::string::npos) {
+                std::string hexStr = line.substr(2, hPos - 2);
+                bool allHex = !hexStr.empty() &&
+                    std::all_of(hexStr.begin(), hexStr.end(), [](char c) {
+                        return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+                    });
+                // Bit index follows the 'H' as ".N".
+                int bitIdx = -1;
+                if (allHex && hPos + 1 < line.size() && line[hPos + 1] == '.') {
+                    size_t bs = hPos + 2;
+                    size_t be = bs;
+                    while (be < line.size() &&
+                           std::isdigit(static_cast<unsigned char>(line[be]))) ++be;
+                    if (be > bs) {
+                        try { bitIdx = std::stoi(line.substr(bs, be - bs)); }
+                        catch (...) { bitIdx = -1; }
+                    }
+                }
+                if (allHex && bitIdx >= 0 && bitIdx <= 7) {
+                    uint32_t byteAddr = 0;
+                    try { byteAddr = static_cast<uint32_t>(std::stoul(hexStr, nullptr, 16)); }
+                    catch (...) { goto skip_bit; }
+                    size_t pubPos = line.find("PUBLIC");
+                    size_t nameStart = line.find_first_not_of(" \t", pubPos + 6);
+                    if (nameStart != std::string::npos) {
+                        size_t nameEnd = line.find_first_of(" \t\r\n", nameStart);
+                        std::string varName = line.substr(nameStart,
+                            nameEnd == std::string::npos ? std::string::npos
+                                                         : nameEnd - nameStart);
+                        if (!varName.empty() && varName[0] != '?') {
+                            m_bits.push_back({varName,
+                                              static_cast<uint8_t>(byteAddr & 0xFF),
+                                              static_cast<uint8_t>(bitIdx)});
+                        }
+                    }
+                }
+            }
+            skip_bit:;
+        }
+
         // ---- Parse C:XXXXH lines ----
         if (line.size() < 4 || std::toupper(line[0]) != 'C' || line[1] != ':')
             continue;
@@ -656,7 +703,15 @@ std::optional<SourceLocation> SymbolTable::LookupLine(uint32_t addr) const
     // line, while the first real executable statement appears a few bytes later.
     // If the current PC is still in that tiny entry/prologue window, prefer the
     // next nearby line so the debugger lands in the function body.
-    std::string sym = LookupSymbol(addr);
+    //
+    // CAVEAT: When multiple LINE# entries share the same address (e.g. function
+    // signature + opening brace + first executable statement all map to the
+    // function entry), the sort already promoted the highest line number — which
+    // IS the first executable statement.  Skipping in that case would walk past
+    // the user's breakpoint line.  Only apply the prologue-skip when 'it' is
+    // the SOLE entry at this address (a true "declaration-only" mapping).
+    bool isSoleAtAddr = (it == m_lines.begin()) || ((it - 1)->addr != it->addr);
+    std::string sym = isSoleAtAddr ? LookupSymbol(addr) : std::string();
     if (!sym.empty()) {
         auto symIt = std::upper_bound(m_symbols.begin(), m_symbols.end(), addr,
             [](uint32_t a, const Symbol& s) { return a < s.addr; });
@@ -862,6 +917,23 @@ std::optional<GlobalVariable> SymbolTable::LookupGlobalByName(const std::string&
             }
         }
         if (match) return gv;
+    }
+    return std::nullopt;
+}
+
+std::optional<BitVariable> SymbolTable::LookupBitByName(const std::string& name) const
+{
+    for (const auto& bv : m_bits) {
+        if (bv.name.size() != name.size()) continue;
+        bool match = true;
+        for (size_t i = 0; i < name.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(bv.name[i])) !=
+                std::tolower(static_cast<unsigned char>(name[i]))) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return bv;
     }
     return std::nullopt;
 }

@@ -16,6 +16,8 @@
 $src     = "$PSScriptRoot\.."
 $binSrc  = "$src\build\dap_server\bin\Debug"
 $out     = "$src\Release"
+$pkgJson = Get-Content "$src\vscode-extension\package.json" | ConvertFrom-Json
+$version = $pkgJson.version
 
 if (-not (Test-Path $binSrc\dap_server.exe)) {
     Write-Error "dap_server.exe not found — run: cmake --build build --target dap_server --config Debug"
@@ -26,6 +28,7 @@ if (-not (Test-Path $binSrc\dap_server.exe)) {
 if (Test-Path $out) { Remove-Item -Recurse -Force $out }
 New-Item -ItemType Directory -Path $out\bin          | Out-Null
 New-Item -ItemType Directory -Path $out\vscode-extension | Out-Null
+New-Item -ItemType Directory -Path $out\vscode-extension\media | Out-Null
 
 # --- Binaries ---
 Copy-Item "$binSrc\dap_server.exe"  $out\bin\
@@ -36,6 +39,7 @@ Copy-Item "$binSrc\USBHID.dll"      $out\bin\
 # --- VSCode extension ---
 Copy-Item "$src\vscode-extension\package.json" $out\vscode-extension\
 Copy-Item "$src\vscode-extension\extension.js" $out\vscode-extension\
+Copy-Item "$src\vscode-extension\media\icon.png" $out\vscode-extension\media\
 
 # --- start_server.ps1 (paths relative to Release\) ---
 Set-Content "$out\start_server.ps1" @'
@@ -64,7 +68,7 @@ if ($proc) {
 
 # --- install_extension.ps1 (points to Release\vscode-extension\) ---
 Set-Content "$out\install_extension.ps1" @'
-$extName   = "local.silabs-8051-debug-0.10.0"
+$extName   = "local.silabs-8051-debug-$version"
 $extSource = "$PSScriptRoot\vscode-extension"
 $extTarget = "$env:USERPROFILE\.vscode\extensions\$extName"
 
@@ -124,7 +128,7 @@ If your Keil installation is not at the default `C:\Keil_v5` location, set:
    ```
 2. Open your firmware project in VSCode.
 3. Press **F5** and select a launch configuration:
-   - **Debug** — resets the target and halts at PC=0x0000 for live debugging.
+  - **Debug** — resets the target and runs to the application entry point for live debugging.
    - **Flash + Verify** — erases, programs and verifies. No debug session.
    - **Flash (no erase)** — programs and verifies only (faster, skips erase).
 4. To stop the server:
@@ -142,6 +146,7 @@ If your Keil installation is not at the default `C:\Keil_v5` location, set:
 | `buildTarget` | *(from .uvopt)* | µVision target name passed as `-t <name>` to UV4.exe. If omitted, UV4 uses the last-active target from the project. |
 | `noDebug` | `false` | `true` → flash-only mode, no debug session. |
 | `noErase` | `false` | `true` → skip erase pass (program+verify only). |
+| `startAddress` | *(from HEX base address)* | Override the application entry point address when the lowest HEX address is not the desired start point. |
 
 ## Debug features
 
@@ -201,8 +206,7 @@ Set-Content "$out\template_launch.json" @'
       "request": "launch",
       "name": "Debug (SiLabs 8051)",
       "uvprojFile": "${workspaceFolder}/YourProject.uvproj",
-      "buildBeforeDebug": true,
-      "preLaunchTask": "Ensure DAP Server"
+      "buildBeforeDebug": true
     },
     {
       "type": "silabs8051",
@@ -234,7 +238,7 @@ Write-Host "  2. Run Release\install_extension.ps1  (once per machine)"
 Write-Host "  3. Restart VSCode."
 Write-Host "  4. Copy template_launch.json to your project's .vscode\launch.json"
 Write-Host "     and update 'uvprojFile' to your .uvproj path."
-Write-Host "  5. Run Release\start_server.ps1 before pressing F5."
+Write-Host "  5. Press F5 (the extension can auto-start the bundled server), or run Release\start_server.ps1 if you want manual control."
 
 # ---------------------------------------------------------------------------
 # Build a .vsix so users can install the extension via VSCode's
@@ -242,8 +246,6 @@ Write-Host "  5. Run Release\start_server.ps1 before pressing F5."
 # A .vsix is a ZIP file with a specific layout understood by VSCode.
 # ---------------------------------------------------------------------------
 
-$pkgJson = Get-Content "$src\vscode-extension\package.json" | ConvertFrom-Json
-$version = $pkgJson.version
 $vsixPath = "$out\silabs-8051-debug-$version.vsix"
 
 # Temporary staging folder
@@ -255,6 +257,8 @@ New-Item -ItemType Directory -Path "$stage\extension" | Out-Null
 Copy-Item "$src\vscode-extension\package.json" "$stage\extension\"
 Copy-Item "$src\vscode-extension\extension.js"  "$stage\extension\"
 Copy-Item "$src\vscode-extension\README.md"     "$stage\extension\"
+New-Item -ItemType Directory -Path "$stage\extension\media" | Out-Null
+Copy-Item "$src\vscode-extension\media\icon.png" "$stage\extension\media\"
 
 # Bundle dap_server.exe and SiC8051F.wsp
 # SiC8051F.dll and USBHID.dll are NOT bundled — they are Keil's proprietary

@@ -41,8 +41,7 @@ paste this template and update `uvprojFile`:
       "request": "launch",
       "name": "Debug",
       "uvprojFile": "${workspaceFolder}/YourProject.uvproj",
-      "buildBeforeDebug": true,
-      "preLaunchTask": "Ensure DAP Server"
+      "buildBeforeDebug": true
     },
     {
       "type": "silabs8051",
@@ -58,6 +57,13 @@ paste this template and update `uvprojFile`:
 
 > **Prerequisites:** [Keil µVision](https://www.keil.com/download/product/) with the
 > C51 toolchain installed. The extension auto-detects it via the Windows registry.
+
+For a normal installed VSIX, leave `preLaunchTask` out and let the extension start its
+bundled server automatically.
+
+For repeated development/debug loops in this repo, prefer a workspace task that runs
+`scripts\restart_server_safe.ps1` and point `preLaunchTask` at that task so each F5
+starts from a clean server process.
 
 ---
 
@@ -123,20 +129,14 @@ directory automatically.
 Creates a junction from `~/.vscode/extensions/local.silabs-8051-debug-0.13.0` to
 `vscode-extension\`. Reload VSCode afterwards (`Ctrl+Shift+P` → `Developer: Reload Window`).
 
+The junction name tracks the current extension version, for example
+`local.silabs-8051-debug-0.14.6`.
+
 ---
 
 ## Usage
 
-### 1. Start the DAP server
-
-```powershell
-.\scripts\start_server.ps1
-```
-
-Opens a new console window. The server stays running between debug sessions.
-Verbose log (DLL internals) is written to `dap_server.log`.
-
-### 2. Add a launch configuration to your firmware project
+### 1. Add a launch configuration to your firmware project
 
 Create `.vscode\launch.json` in your firmware project folder (or use **Add Configuration…**
 in the VSCode launch.json editor):
@@ -150,8 +150,7 @@ in the VSCode launch.json editor):
       "request": "launch",
       "name": "Debug",
       "uvprojFile": "${workspaceFolder}/YourProject.uvproj",
-      "buildBeforeDebug": true,
-      "preLaunchTask": "Ensure DAP Server"
+      "buildBeforeDebug": true
     },
     {
       "type": "silabs8051",
@@ -174,15 +173,29 @@ in the VSCode launch.json editor):
 }
 ```
 
-### 3. Press F5
+Optional for development in this repo: add a workspace task that runs
+`scripts\restart_server_safe.ps1` and reference it as `preLaunchTask` in your debug
+configuration. That restart-first path is the most reliable way to recover from a dirty
+post-stop AGDI state during repeated F5 cycles.
+
+### 2. Press F5
 
 VSCode connects to `127.0.0.1:4711` automatically. The DAP server erases/programs/verifies
-(flash mode) or resets and halts at PC=0x0000 (debug mode).
+(flash mode) or resets and runs to the application entry point before halting (debug mode).
+If your HEX base address is not the true entry point, set `startAddress` explicitly.
 
-### 4. Stop the server when done
+### 3. Optional manual server control
 
 ```powershell
 .\scripts\stop_server.ps1
+```
+
+For development/recovery there are also safe task-oriented scripts:
+
+```powershell
+.\scripts\ensure_server_safe.ps1
+.\scripts\restart_server_safe.ps1
+.\scripts\stop_server_safe.ps1
 ```
 
 ---
@@ -197,6 +210,7 @@ VSCode connects to `127.0.0.1:4711` automatically. The DAP server erases/program
 | `buildTarget` | string | *(from .uvopt)* | µVision target name passed as `-t <name>` to UV4.exe. If omitted, UV4 builds whichever target was last active in the project. |
 | `noDebug` | boolean | `false` | `true` → flash-only (no debug session). |
 | `noErase` | boolean | `false` | `true` → skip erase pass (program+verify only, faster). |
+| `startAddress` | string | *(from HEX base address)* | Override the application entry point address (for example `0x2400`) when the lowest HEX address is not the code location you want launch to run to. |
 
 ---
 
@@ -253,8 +267,10 @@ Run `.\scripts\install_extension.ps1` and reload VSCode.
 Check the USB Debug Adapter is plugged in and the debug header is seated. Restart the server.
 
 **Device doesn't run after `continue`**
-The WDT disable sequence is applied automatically. If the device still doesn't run,
-check the USB Debug Adapter connection and restart the server.
+The watchdog is disabled automatically before launch/continue. If a session wedges after
+Stop or after an abnormal target reset, restart the server before the next F5. During
+development, using a `preLaunchTask` that runs `restart_server_safe.ps1` is the most
+reliable recovery path.
 
 **Can't reconnect after VSCode crash**
 The server automatically cleans up if VSCode drops the TCP connection without
@@ -287,6 +303,9 @@ C8051_dap_server/
     start_server.ps1       Launch dap_server.exe in a new console window
     stop_server.ps1        Kill dap_server.exe
     ensure_server.ps1      Idempotent start (safe as preLaunchTask)
+    ensure_server_safe.ps1 Safe hidden start for repeated dev/debug cycles
+    restart_server_safe.ps1 Stop + clean restart for the next F5
+    stop_server_safe.ps1   Stop tracked dap_server.exe instances
     install_extension.ps1  Install the VSCode extension via junction
     make_release.ps1       Assemble a self-contained Release\ folder
     tests/                 Python DAP integration tests

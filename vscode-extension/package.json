@@ -2,7 +2,7 @@
   "name": "silabs-8051-debug",
   "displayName": "SiLabs 8051 Debug",
   "description": "Debug adapter for Silicon Laboratories 8051 MCUs via AGDI / EC3 USB Debug Adapter",
-  "version": "0.13.1",
+  "version": "0.14.6",
   "publisher": "KMIMusic",
   "author": {
     "name": "Eric Bateman",
@@ -19,6 +19,7 @@
   },
   "engines": { "vscode": "^1.80.0" },
   "categories": ["Debuggers"],
+  "icon": "media/icon.png",
   "activationEvents": ["onDebugResolve:silabs8051"],
   "main": "./extension.js",
   "contributes": {
@@ -45,6 +46,26 @@
       {
         "command": "silabs8051.browseKeilPath",
         "title": "Browse for Keil Installation Folder",
+        "category": "SiLabs 8051"
+      },
+      {
+        "command": "silabs8051.configureIntelliSense",
+        "title": "Configure IntelliSense for Keil C51 Workspace",
+        "category": "SiLabs 8051"
+      },
+      {
+        "command": "silabs8051.startServer",
+        "title": "Start DAP Server",
+        "category": "SiLabs 8051"
+      },
+      {
+        "command": "silabs8051.stopServer",
+        "title": "Stop DAP Server",
+        "category": "SiLabs 8051"
+      },
+      {
+        "command": "silabs8051.restartServer",
+        "title": "Restart DAP Server",
         "category": "SiLabs 8051"
       }
     ],
@@ -87,6 +108,10 @@
                 "type": "boolean",
                 "description": "Skip the flash-erase pass (program + verify only, faster).",
                 "default": false
+              },
+              "startAddress": {
+                "type": "string",
+                "description": "Override the application entry point address (hex string, e.g. '0x2400'). If omitted, the DAP server automatically uses the lowest address in the HEX file. Set this when the HEX base is not the true entry point."
               }
             }
           }
@@ -97,8 +122,7 @@
             "request": "launch",
             "name": "Debug (SiLabs 8051)",
             "uvprojFile": "${workspaceFolder}/YourProject.uvproj",
-            "buildBeforeDebug": true,
-            "preLaunchTask": "Ensure DAP Server"
+            "buildBeforeDebug": true
           }
         ],
         "configurationSnippets": [
@@ -110,8 +134,7 @@
               "request": "launch",
               "name": "Debug (SiLabs 8051)",
               "uvprojFile": "^\"\\${workspaceFolder}/YourProject.uvproj\"",
-              "buildBeforeDebug": true,
-              "preLaunchTask": "Ensure DAP Server"
+              "buildBeforeDebug": true
             }
           },
           {

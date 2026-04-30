@@ -59,6 +59,17 @@ struct GlobalVariable {
 };
 
 // ---------------------------------------------------------------------------
+// BitVariable — a PUBLIC C51 `bit` symbol from the m51 map
+// (m51 format: "B:XXh.B  PUBLIC  name", e.g. "B:0021H.4  PUBLIC foo")
+// ---------------------------------------------------------------------------
+
+struct BitVariable {
+    std::string name;        // e.g. "libraryChecksComplete"
+    uint8_t     byteAddr;    // bit-addressable byte in DATA space (0x20-0x2F)
+    uint8_t     bitIndex;    // 0..7 within the byte
+};
+
+// ---------------------------------------------------------------------------
 // SymbolTable
 // ---------------------------------------------------------------------------
 
@@ -112,6 +123,10 @@ public:
     // Look up a global variable by name (case-insensitive).
     // Returns nullopt if not found.
     std::optional<GlobalVariable> LookupGlobalByName(const std::string& name) const;
+
+    // Look up a `bit` variable by name (case-insensitive).
+    // Returns nullopt if not found.
+    std::optional<BitVariable> LookupBitByName(const std::string& name) const;
 
     // Return the code address of the next LINE# entry after `pc`.
     // Used for fast source-level stepping via temp breakpoints.
@@ -168,6 +183,9 @@ private:
 
     // Global variables (PUBLIC data symbols at module level).
     std::vector<GlobalVariable> m_globals;
+
+    // Bit-addressable PUBLIC `bit` variables.
+    std::vector<BitVariable> m_bits;
 
     bool m_loaded = false;
 };
