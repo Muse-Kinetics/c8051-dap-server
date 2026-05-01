@@ -3,7 +3,7 @@
   "displayName": "SiLabs 8051 Debug",
   "description": "Debug adapter for Silicon Laboratories 8051 MCUs via AGDI / EC3 USB Debug Adapter",
   "version": "0.14.6",
-  "publisher": "KMIMusic",
+  "publisher": "KMIMusicInc",
   "author": {
     "name": "Eric Bateman",
     "email": "eric@musekinetics.com"
